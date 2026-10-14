@@ -1,0 +1,1 @@
+Evidence strategy: ${name}. Evidence is under ${root}. Each numbered directory contains trajectory.json, openai-messages.jsonl, openai-tools.json, verifier-summary.json, verifier-feedback.json when verifier output was captured, llm-context.jsonl when captured, sanitized_result.json, and usually instruction.md. Use this evidence to infer generic harness improvements.

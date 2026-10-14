@@ -1,0 +1,54 @@
+# Example run.yaml for `hevo run`. Paths are relative to this file unless absolute.
+# See src/harness_evolution/core/run_config.py for every key.
+run_dir: ../../runs/tmax32-tb21-example
+
+# Evolve config (initial harness, evidence strategy, evolver agent, validation)
+# and gate config (static checks, held-out backend). Either a path or an inline mapping.
+evolve: evolve.yaml
+gate: gate.yaml
+
+data:
+  held_in_catalog: /path/to/tmax_all.jsonl     # a fresh disjoint batch is drawn each step
+  held_in_size: 32
+  held_out: /path/to/tb21_all_89.json          # fixed split, used only by the gate
+  task_catalogs:                               # task_dir / image metadata for both splits
+    - /path/to/tmax_all.jsonl
+    - /path/to/tb21_images.jsonl
+
+loop:
+  steps: 10
+  candidates: 2
+  sampling_repeats: 1
+  gate_repeats: 2
+  validation_pool_size: 32
+  sampling_concurrency: 32
+
+gate_model:
+  names: [policy-replica-a, policy-replica-b]
+  gateway: http://llm-proxy.example:8000
+
+# KEY=VALUE files, e.g. sandbox credentials. Values are never printed by --dry-run.
+env_files: []
+
+# Knobs that modules read from the environment.
+env:
+  HARNESSRL_OPENCODE_SETUP: afs_bin
+  HARNESS_AFS_PUBLISH: "1"
+  HARNESS_AFS_PUBLISH_IMAGE: ailab/hamishivi:swerl-tmax-v3-0e7ceb295a7d
+  HARNESSRL_GATE_TIMEOUT_SEC: "10800"
+  SANDBOX_TRIAL_RETRIES: "2"
+  OPENCODE_SETUP_TIMEOUT_SEC: "180"
+  OPEN_SANDBOX_RECEIPT_RECOVERY_TIMEOUT: "60"
+  AGENT_TIMEOUT_POLICY: metadata
+  # Run-scoped admission (journal under <run_dir>/capacity). The default
+  # "strict" mode also enforces the 384-sandbox/CPU budget of the whole project.
+  OPEN_SANDBOX_CAPACITY_MODE: local
+  SANDBOX_CAPACITY_SCOPE: run
+  SANDBOX_CAPACITY_LIMIT: "64"
+  # Codex reaches chatgpt.com only through the cluster proxy.
+  HTTP_PROXY: http://httpproxy-headless.kubebrain.svc.pjlab.local:3128
+  HTTPS_PROXY: http://httpproxy-headless.kubebrain.svc.pjlab.local:3128
+  http_proxy: http://httpproxy-headless.kubebrain.svc.pjlab.local:3128
+  https_proxy: http://httpproxy-headless.kubebrain.svc.pjlab.local:3128
+  NO_PROXY: 127.0.0.1,localhost,::1,.pjlab.local,.svc,.svc.cluster.local
+  no_proxy: 127.0.0.1,localhost,::1,.pjlab.local,.svc,.svc.cluster.local

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+runs/
+evolution-runs/
+harness_sync_stage/
+tools/trace-proxy/trace-proxy

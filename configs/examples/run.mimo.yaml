@@ -1,0 +1,59 @@
+# run.yaml with MiMo held-in tasks and a fixed 100-task MiMo gate.
+# Paths are relative to this file unless absolute; see core/run_config.py for every key.
+run_dir: ../../runs/mimo32-tb21-example
+
+evolve: evolve.yaml
+gate: gate.yaml
+
+data:
+  # Both files come from one `python -m harness_evolution.tasks.mimo_catalog
+  # --gate-size 100` call over the Qwen3.6 k=8 screening (tasks solved 1..7/8):
+  # 100 gate tasks (2..6/8, stratified, seed 20261014) and the other 1609 for
+  # held-in, so the two never overlap.
+  held_in_catalog: /mnt/shared-storage-gpfs2/safewt-share02/sunyoubang/yuanjiarui/wangxianghe/evoloop/data/mimo-heldin-qwen36-1to7-minus-gate100-20261014.jsonl
+  held_in_size: 32
+  # Fixed MiMo gate split that decides promotion.  TB2.1 (tb21_all_89.json)
+  # stays as a final evaluation outside the loop.
+  held_out: /mnt/shared-storage-gpfs2/safewt-share02/sunyoubang/yuanjiarui/wangxianghe/evoloop/data/mimo-gate100-qwen36-2to6-20261014.json
+  task_catalogs:
+    # The held-in catalog is added automatically; list the gate's rows.
+    - /mnt/shared-storage-gpfs2/safewt-share02/sunyoubang/yuanjiarui/wangxianghe/evoloop/data/mimo-gate100-qwen36-2to6-20261014.jsonl
+
+loop:
+  steps: 10
+  candidates: 2
+  sampling_repeats: 1
+  gate_repeats: 2
+  validation_pool_size: 32
+  sampling_concurrency: 32
+
+gate_model:
+  names: [policy-replica-a, policy-replica-b]
+  gateway: http://llm-proxy.example:8000
+
+env_files: []
+
+env:
+  HARNESSRL_OPENCODE_SETUP: afs_bin
+  HARNESS_AFS_PUBLISH: "1"
+  # Image of the short-lived sandbox that copies each binary to AFS; MiMo
+  # catalog rows carry no image_tag the publisher could fall back to.
+  HARNESS_AFS_PUBLISH_IMAGE: ailab/hamishivi:swerl-tmax-v3-0e7ceb295a7d
+  HARNESSRL_GATE_TIMEOUT_SEC: "10800"
+  SANDBOX_TRIAL_RETRIES: "2"
+  OPENCODE_SETUP_TIMEOUT_SEC: "180"
+  OPEN_SANDBOX_RECEIPT_RECOVERY_TIMEOUT: "60"
+  AGENT_TIMEOUT_POLICY: metadata
+  # Run-scoped admission (journal under <run_dir>/capacity). The default
+  # "strict" mode also enforces the 384-sandbox/CPU budget of the whole project.
+  OPEN_SANDBOX_CAPACITY_MODE: local
+  SANDBOX_CAPACITY_SCOPE: run
+  SANDBOX_CAPACITY_LIMIT: "64"
+  # Codex reaches chatgpt.com only through the cluster proxy; the values match
+  # the 1011 loop driver (submit_harnessRL_tmax32_cpu_rjob_20261011.sh).
+  HTTP_PROXY: http://httpproxy-headless.kubebrain.svc.pjlab.local:3128
+  HTTPS_PROXY: http://httpproxy-headless.kubebrain.svc.pjlab.local:3128
+  http_proxy: http://httpproxy-headless.kubebrain.svc.pjlab.local:3128
+  https_proxy: http://httpproxy-headless.kubebrain.svc.pjlab.local:3128
+  NO_PROXY: 127.0.0.1,localhost,::1,.pjlab.local,.svc,.svc.cluster.local
+  no_proxy: 127.0.0.1,localhost,::1,.pjlab.local,.svc,.svc.cluster.local

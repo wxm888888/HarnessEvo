@@ -1,0 +1,1 @@
+Evidence strategy: ${name}. Evidence is under ${root}. Each numbered directory contains sanitized_result.json and usually instruction.md. Do not use full trajectory tool-call details for this strategy.
