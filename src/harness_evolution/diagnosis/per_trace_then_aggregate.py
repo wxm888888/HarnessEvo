@@ -489,7 +489,7 @@ class PerTraceThenAggregateEvidence(AgentAnalyzedEvidence):
                 if source.is_dir():
                     shutil.copytree(source, target)
                 else:
-                    target.symlink_to(source)
+                    shutil.copy2(source, target)
             xdg_root = result_dir / "trace_runs" / safe_id / "xdg"
             for key, child in (
                 ("XDG_DATA_HOME", "data"),
@@ -701,7 +701,7 @@ class PerTraceThenAggregateEvidence(AgentAnalyzedEvidence):
                     "opencode_repo_path": str(analyzer_config["opencode_repo_path"]),
                     "dev_run_command_prefix": str(analyzer_config["dev_run_command_prefix"]),
                     "dev_run_add_dir_arg": True,
-                    "dev_run_env": run_env,
+                    "dev_run_env": {**dict(client_init.get("dev_run_env") or {}), **run_env},
                 }
             )
         elif client_name == "codex_cli_client":

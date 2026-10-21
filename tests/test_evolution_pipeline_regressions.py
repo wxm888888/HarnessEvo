@@ -46,49 +46,7 @@ from harness_evolution.loop.two_sided import (  # noqa: E402
     _prune_completed_step_artifacts,
     _repeat_counts,
 )
-from harness_evolution.integrations.slime.select_trajectories import main as select_main  # noqa: E402
 
-
-def _polar_payload(*, session_id: str, task_id: str, reward: float, multi_trace: bool) -> dict:
-    prompt = [
-        {"role": "system", "content": "You are opencode."},
-        {"role": "user", "content": "Fix the task."},
-    ]
-    traces = [
-        {
-            "session_id": session_id,
-            "task_id": task_id,
-            "trace_index": 0,
-            "finish_reason": "stop",
-            "response_length": 4,
-            "status": "completed",
-            "prompt_messages": prompt,
-            "response_messages": [{"role": "assistant", "content": "First attempt."}],
-        }
-    ]
-    if multi_trace:
-        traces.append(
-            {
-                "session_id": session_id,
-                "task_id": task_id,
-                "trace_index": 1,
-                "finish_reason": "stop",
-                "response_length": 3,
-                "status": "completed",
-                "prompt_messages": prompt,
-                "response_messages": [{"role": "assistant", "content": "Continuation."}],
-            }
-        )
-    return {
-        "session_id": session_id,
-        "task_id": task_id,
-        "session_status": "COMPLETED",
-        "result_error": None,
-        "trajectory_status": "COMPLETED",
-        "session_reward": reward,
-        "num_traces": len(traces),
-        "traces": traces,
-    }
 
 
 def test_dependency_cache_bridges_source_and_worktree_filesystems(tmp_path: Path) -> None:
@@ -134,8 +92,9 @@ def test_candidate_prompt_requires_skill_runtime_change_and_report() -> None:
     assert "If skill loading fails" in prompt
     assert "FILTERED DIAGNOSIS VIEW" in prompt
     assert "one hypothesis or a coherent combination of multiple hypotheses" in prompt
-    assert "only changes root AGENTS.md" in prompt
-    assert "executable OpenCode runtime behavior included in the sandbox binary" in prompt
+    assert "Problem-solving skills are located in `.opencode/skills/`" in prompt
+    assert "You may modify code and skills together" in prompt
+    assert "skill_assessment" in prompt
     assert ".harness_evolver/candidate-report.json" in prompt
     assert "The controller will run typecheck and build validation" in prompt
 
@@ -376,59 +335,3 @@ def test_resume_reuses_a_complete_rejected_gate(tmp_path: Path) -> None:
     )
 
     assert recovered == gate
-
-
-def test_selector_preserves_selected_multi_trace_sessions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    trajectory_root = tmp_path / "trajectories"
-    rollout = trajectory_root / "rollout_000001"
-    output = tmp_path / "tb_job"
-    rollout.mkdir(parents=True)
-    payloads = [
-        _polar_payload(
-            session_id="mixed-success",
-            task_id="polar-tb-harbor-0-0-traj-0",
-            reward=1.0,
-            multi_trace=True,
-        ),
-        _polar_payload(
-            session_id="mixed-failure",
-            task_id="polar-tb-harbor-0-0-traj-1",
-            reward=0.0,
-            multi_trace=False,
-        ),
-    ]
-    for payload in payloads:
-        (rollout / f"{payload['session_id']}.json").write_text(
-            json.dumps(payload), encoding="utf-8"
-        )
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "select_trajectories_for_evolution.py",
-            "--trajectory-root",
-            str(trajectory_root),
-            "--end-rollout-id",
-            "1",
-            "--window",
-            "1",
-            "--max-extra-scan",
-            "0",
-            "--pure-fail-tasks",
-            "0",
-            "--mixed-tasks",
-            "1",
-            "--pure-success-tasks",
-            "0",
-            "--output-dir",
-            str(output),
-        ],
-    )
-
-    assert select_main() == 0
-    manifest = json.loads((output / "conversion_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["converted_count"] == 2
-    assert manifest["include_multi_trace"] is True
-    assert {record["selection_bucket"] for record in manifest["records"]} == {"mixed"}

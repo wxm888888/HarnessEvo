@@ -4,7 +4,7 @@
   hevo evolve ...        diagnose + propose from an existing trajectory job (no sampling, no gate)
   hevo loop ...          two-sided loop with its raw flags (what `run` builds from run.yaml)
   hevo gate ...          static and held-out gate for one candidate workspace
-  hevo slime-pipeline ...   one co-evolution step called from slime training
+  hevo rl-round ...      one evolution round called from RL training
   hevo status RUN_DIR    summarize a run's state.json
 
 Subcommands other than `run` and `status` pass their arguments unchanged to
@@ -23,7 +23,7 @@ _PASSTHROUGH: dict[str, tuple[str, str]] = {
     "evolve": ("harness_evolution.loop.from_existing_job", "diagnose and propose from an existing trajectory job"),
     "loop": ("harness_evolution.loop.two_sided", "two-sided loop with raw flags"),
     "gate": ("harness_evolution.evaluation.gate", "gate one candidate workspace"),
-    "slime-pipeline": ("harness_evolution.integrations.slime.pipeline", "co-evolution step called from slime"),
+    "rl-round": ("harness_evolution.rl.__main__", "one evolution round called from RL training"),
 }
 
 

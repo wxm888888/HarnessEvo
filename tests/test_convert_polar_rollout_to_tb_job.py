@@ -122,6 +122,13 @@ class PolarConversionTest(unittest.TestCase):
             output = root / "converted"
             source.mkdir()
             failure = _payload(session_id="failure", reward=0.0)
+            failure.update(
+                dataset_task_id="format-code-task-000588",
+                dataset_task_file="/tasks/format-code-task-000588.json",
+                dataset_task_sha256="abc123",
+                dataset_mimo_dataset_type="opensource-code",
+                dataset_image_tag="mimo:000588",
+            )
             success = _payload(session_id="success", reward=1.0)
             error = _payload(session_id="error", status="ERROR", reward=0.0)
             error["result_error_type"] = "ContextLengthExceeded"
@@ -169,6 +176,14 @@ class PolarConversionTest(unittest.TestCase):
             self.assertFalse((output / "error").exists())
             self.assertFalse((output / "truncated").exists())
             self.assertFalse((output / "multi").exists())
+            failure_record = next(
+                record for record in manifest["records"] if record["session_id"] == "failure"
+            )
+            self.assertEqual(
+                failure_record["dataset_task_file"], "/tasks/format-code-task-000588.json"
+            )
+            self.assertEqual(failure_record["dataset_task_sha256"], "abc123")
+            self.assertEqual(failure_record["dataset_mimo_dataset_type"], "opensource-code")
 
             diagnostic_manifest = convert_rollout(
                 source_dir=source,

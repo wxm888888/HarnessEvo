@@ -140,13 +140,27 @@ def _persist_candidate_commit(config: dict[str, Any], workspace: Path, commit: s
     tag = f"harness-evolved-{commit[:12]}"
     fetch = _git(baseline_repo, "fetch", str(workspace), commit)
     if fetch.returncode != 0:
-        _log(f"WARNING: could not persist candidate {commit[:12]} into baseline repo (fetch failed): {fetch.stdout.strip()}")
-        return
-    tag_result = _git(baseline_repo, "tag", "-f", tag, "FETCH_HEAD")
+        raise RuntimeError(f"could not persist candidate {commit[:12]} into baseline repo (fetch failed): {fetch.stdout.strip()}")
+    tag_result = _git(baseline_repo, "tag", "-f", tag, commit)
     if tag_result.returncode != 0:
-        _log(f"WARNING: could not persist candidate {commit[:12]} into baseline repo (tag failed): {tag_result.stdout.strip()}")
-        return
+        raise RuntimeError(f"could not persist candidate {commit[:12]} into baseline repo (tag failed): {tag_result.stdout.strip()}")
     _log(f"persisted candidate {commit[:12]} into baseline repo {baseline_repo} as tag {tag}")
+
+
+def _prepare_for_promotion(
+    config: dict[str, Any], workspace: Path | None, commit: str,
+    binary_path: str, verdict: dict[str, Any], report_path: Path,
+) -> None:
+    """A winner must remain Git-reachable before it can become active."""
+    try:
+        if workspace is None:
+            raise RuntimeError(f"no workspace found for winner {commit[:12]}")
+        _persist_candidate_commit(config, workspace, commit)
+    except Exception as exc:
+        verdict.update(accepted=False, gate_passed=True, persistence_error=str(exc))
+        report_path.write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
+        raise
+    _publish_for_promotion(commit, binary_path, verdict, report_path)
 
 
 # -----------------------------------------------------------------------------
@@ -479,11 +493,20 @@ def run_full_gate(
     verdict["report_path"] = str(report_path)
     _log(f"verdict: {'ACCEPT' if accepted else 'REJECT'} -> {report_path}")
 
+    # Persisting the commit and publishing the binary are what make an accepted
+    # candidate *reachable*; neither depends on who records the promotion. A
+    # caller that owns its own version state (the RL loop promotes from the
+    # returned verdict) passes no `version_state` and must still end up with a
+    # fetchable commit and an installed binary.
+    if accepted:
+        _prepare_for_promotion(
+            config, workspace, static_result.candidate_commit,
+            static_result.binary_path, verdict, report_path,
+        )
+
     state_path = _paths(config).get("version_state")
     if state_path:
         if accepted:
-            _persist_candidate_commit(config, workspace, static_result.candidate_commit)
-            _publish_for_promotion(static_result.candidate_commit, static_result.binary_path, verdict, report_path)
             version_state.promote(
                 state_path,
                 static_result.candidate_commit,
@@ -556,6 +579,10 @@ def run_full_gate_multi(
         "num_static_gate_survivors": len(survivors),
         "baseline_commit": _resolve_baseline(config)["commit"],
         "winner_commit": winner.candidate_commit if winner else "",
+        # Promoting the winner needs its binary, and a caller holding only the
+        # verdict would otherwise have to find it among per-candidate records.
+        "winner_binary_path": winner.binary_path if winner else "",
+        "winner_workspace": str(workspace_by_commit.get(winner.candidate_commit, "")) if winner else "",
         "candidates": [
             {
                 "workspace": str(workspace),
@@ -576,15 +603,18 @@ def run_full_gate_multi(
     else:
         _log(f"verdict: REJECT (0/{len(workspaces)} candidates cleared the gate) -> {report_path}")
 
+    # See run_full_gate: reachability of the winner is not conditional on
+    # recording the promotion here.
+    if winner is not None:
+        winner_workspace = workspace_by_commit.get(winner.candidate_commit)
+        _prepare_for_promotion(
+            config, winner_workspace, winner.candidate_commit,
+            winner.binary_path, verdict, report_path,
+        )
+
     state_path = _paths(config).get("version_state")
     if state_path:
         if winner is not None:
-            winner_workspace = workspace_by_commit.get(winner.candidate_commit)
-            if winner_workspace is not None:
-                _persist_candidate_commit(config, winner_workspace, winner.candidate_commit)
-            else:
-                _log(f"WARNING: no workspace found for winner {winner.candidate_commit[:12]}; commit may not persist")
-            _publish_for_promotion(winner.candidate_commit, winner.binary_path, verdict, report_path)
             version_state.promote(
                 state_path,
                 winner.candidate_commit,
@@ -650,6 +680,8 @@ def run_static_gate_multi(
         "num_static_gate_survivors": len(survivors),
         "baseline_commit": _resolve_baseline(config)["commit"],
         "winner_commit": winner.candidate_commit if winner else "",
+        "winner_binary_path": winner.binary_path if winner else "",
+        "winner_workspace": str(workspace_by_commit.get(winner.candidate_commit, "")) if winner else "",
         "candidates": [
             {
                 "workspace": str(workspace),
@@ -666,13 +698,18 @@ def run_static_gate_multi(
     verdict["report_path"] = str(report_path)
     report_path.write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
 
+    # See run_full_gate: reachability of the winner is not conditional on
+    # recording the promotion here.
+    if winner is not None:
+        winner_workspace = workspace_by_commit.get(winner.candidate_commit)
+        _prepare_for_promotion(
+            config, winner_workspace, winner.candidate_commit,
+            winner.binary_path, verdict, report_path,
+        )
+
     state_path = _paths(config).get("version_state")
     if state_path:
         if winner is not None:
-            winner_workspace = workspace_by_commit.get(winner.candidate_commit)
-            if winner_workspace is not None:
-                _persist_candidate_commit(config, winner_workspace, winner.candidate_commit)
-            _publish_for_promotion(winner.candidate_commit, winner.binary_path, verdict, report_path)
             version_state.promote(
                 state_path,
                 winner.candidate_commit,

@@ -230,6 +230,9 @@ class AgentAnalyzedEvidence:
             openai_path = target_dir / "openai-messages.jsonl"
             if openai_source is not None and openai_source.is_file():
                 shutil.copy2(openai_source, openai_path)
+                if (openai_source.parent / "openai-sessions.json").is_file():
+                    from session_exports import copy_exports
+                    copy_exports(openai_source.parent, target_dir)
                 openai_meta_source = openai_source.with_name("openai-messages.meta.json")
                 if openai_meta_source.is_file():
                     shutil.copy2(openai_meta_source, target_dir / openai_meta_source.name)
@@ -508,6 +511,7 @@ class AgentAnalyzedEvidence:
         openai_base_url = analyzer_config["openai_base_url"]
         npm = analyzer_config["npm"]
         generated = {
+            "experimental": {"continue_loop_on_deny": True},
             "model": analyzer_config["model"],
             "enabled_providers": [provider_id],
             "provider": {

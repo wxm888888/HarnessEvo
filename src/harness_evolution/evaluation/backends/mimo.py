@@ -42,6 +42,85 @@ MIMO_HOME = "/home/user"
 # image's root user, as in the screening runner: /root/.bashrc is what puts
 # pyenv and similar toolchains on PATH for the tasks' test scripts.
 ROOT_ENV = {"HOME": "/root"}
+
+# The sandbox reports the host's CPUs (hundreds) through nproc/os.cpu_count
+# while its cgroup quota is ~2 CPUs, so thread pools sized from the CPU count
+# can stall a test until the verifier timeout.  Like the screening runner
+# (duchenyu/mimo_sandbox_resilience.py), every MiMo command and the agent run
+# with thread caps, and Python/Node see the capped CPU count via small hooks.
+CPU_LIMIT = 2
+_NODE_CPU_HOOK_PATH = "/tmp/mimo-cpu-limit.cjs"
+_PYTHON_CPU_HOOK_DIR = "/tmp/mimo-cpu"
+NODE_CPU_HOOK = r"""// Report the sandbox CPU budget to older Node worker pools.
+const fs = require('fs');
+const os = require('os');
+let cap = Number.parseInt(process.env.MIMO_CPU_LIMIT || '2', 10);
+if (!Number.isInteger(cap) || cap < 1) cap = 2;
+try {
+  const [quota, period] = fs.readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim().split(/\s+/);
+  if (quota !== 'max') cap = Math.min(cap, Math.max(1, Math.ceil(Number(quota) / Number(period))));
+} catch (_) {}
+const originalCpus = os.cpus.bind(os);
+os.cpus = () => originalCpus().slice(0, cap);
+if (typeof os.availableParallelism === 'function') {
+  const originalAvailable = os.availableParallelism.bind(os);
+  os.availableParallelism = () => Math.min(cap, originalAvailable());
+}
+try { require('module').syncBuiltinESMExports(); } catch (_) {}
+"""
+PYTHON_CPU_HOOK = r"""# Respect the sandbox CPU budget in older multiprocessing defaults.
+import importlib.machinery as _machinery
+import importlib.util as _util
+import os as _os
+import sys as _sys
+try:
+    _cap = max(1, int(_os.environ.get('MIMO_CPU_LIMIT', '2')))
+except ValueError:
+    _cap = 2
+try:
+    with open('/sys/fs/cgroup/cpu.max') as _f:
+        _quota, _period = _f.read().split()
+    if _quota != 'max':
+        _cap = min(_cap, max(1, (int(_quota) + int(_period) - 1) // int(_period)))
+except (OSError, ValueError):
+    pass
+_original_cpu_count = _os.cpu_count
+_os.cpu_count = lambda: min(_cap, _original_cpu_count() or 1)
+if hasattr(_os, 'process_cpu_count'):
+    _original_process_cpu_count = _os.process_cpu_count
+    _os.process_cpu_count = lambda: min(_cap, _original_process_cpu_count() or 1)
+# Preserve an image's existing sitecustomize hook instead of masking it.
+_here = _os.path.realpath(_os.path.dirname(__file__))
+_search = [p for p in _sys.path if _os.path.realpath(p or _os.getcwd()) != _here]
+_spec = _machinery.PathFinder.find_spec('sitecustomize', _search)
+if _spec is not None and _spec.loader is not None:
+    _original_module = _util.module_from_spec(_spec)
+    _sys.modules['sitecustomize'] = _original_module
+    _spec.loader.exec_module(_original_module)
+"""
+
+
+def cpu_limit_prefix(cap: int = CPU_LIMIT) -> str:
+    """Shell prefix that caps thread pools and enables the CPU-count hooks."""
+    names = [
+        "MIMO_CPU_LIMIT", "OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+        "CMAKE_BUILD_PARALLEL_LEVEL", "CARGO_BUILD_JOBS", "LOKY_MAX_CPU_COUNT", "PYTHON_CPU_COUNT",
+    ]
+    exports = " ".join(f"{name}={cap}" for name in names) + f" MAKEFLAGS=-j{cap}"
+    return (
+        f"export {exports}; "
+        f'if test -f {_NODE_CPU_HOOK_PATH}; then export NODE_OPTIONS="--require={_NODE_CPU_HOOK_PATH} ${{NODE_OPTIONS:-}}"; fi; '
+        f'if test -f {_PYTHON_CPU_HOOK_DIR}/sitecustomize.py; then '
+        f'export PYTHONPATH="{_PYTHON_CPU_HOOK_DIR}${{PYTHONPATH:+:$PYTHONPATH}}"; fi; '
+    )
+
+
+def agent_command(command: str) -> str:
+    """Run an agent step under the same thread caps as setup and verification."""
+    return cpu_limit_prefix() + command
+
+
 _CODE_RECEIPT = re.compile(r"__MIMO_VERIFIER_RC__=([0-9]+)\s*\Z")
 _TERMINAL_RECEIPT = re.compile(r"__POLAR_VERIFIER_REWARD__=([01])\s*__MIMO_VERIFIER_RC__=[0-9]+\s*\Z")
 
@@ -134,7 +213,7 @@ async def _run(
     timeout: int = 60,
     check: bool = True,
 ) -> Any:
-    result = await runtime.exec(command, cwd=cwd, env=dict(ROOT_ENV), timeout_sec=timeout)
+    result = await runtime.exec(cpu_limit_prefix() + command, cwd=cwd, env=dict(ROOT_ENV), timeout_sec=timeout)
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / f"{name}.stdout").write_text(result.stdout or "", encoding="utf-8")
     (log_dir / f"{name}.stderr").write_text(result.stderr or "", encoding="utf-8")
@@ -169,6 +248,9 @@ async def prepare(runtime: Any, task: dict[str, Any], *, session_dir: Path) -> d
         name="preflight",
         log_dir=logs,
     )
+    await _run(runtime, f"mkdir -p {_PYTHON_CPU_HOOK_DIR}", name="cpu_hooks", log_dir=logs)
+    await _upload_bytes(runtime, NODE_CPU_HOOK.encode("utf-8"), _NODE_CPU_HOOK_PATH)
+    await _upload_bytes(runtime, PYTHON_CPU_HOOK.encode("utf-8"), f"{_PYTHON_CPU_HOOK_DIR}/sitecustomize.py")
     hidden = await _run(
         runtime,
         f"cd {cwd} && test ! -e mimo_test_command.sh && test ! -e /tests/test.sh && echo HIDDEN_VERIFIER_ABSENT",

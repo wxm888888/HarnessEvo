@@ -566,7 +566,7 @@ def test_gate_scores_opensandbox_win(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert result.passed is True
 
 
-def test_pipeline_catalog_from_manifest(tmp_path: Path) -> None:
+def test_evidence_tasks_and_catalog_from_manifest(tmp_path: Path) -> None:
     job = tmp_path / "tb_job"
     job.mkdir()
     (job / "conversion_manifest.json").write_text(
@@ -574,36 +574,36 @@ def test_pipeline_catalog_from_manifest(tmp_path: Path) -> None:
             {
                 "records": [
                     {
-                        "dataset_task_id": "task_mixed",
-                        "dataset_task_dir": "/data/task_mixed",
-                        "dataset_image_tag": "img-mixed",
-                        "selection_bucket": "mixed",
+                        "dataset_task_id": "task_one",
+                        "dataset_task_dir": "/data/task_one",
+                        "dataset_image_tag": "img-one",
                     },
+                    # Same task again (a second trace of it), plus a session
+                    # whose task could not be recovered from instruction text.
+                    {"dataset_task_id": "task_one"},
+                    {"dataset_task_id": ""},
                     {
-                        "dataset_task_id": "task_fail",
-                        "dataset_task_dir": "/data/task_fail",
-                        "dataset_image_tag": "img-fail",
-                        "selection_bucket": "pure_fail",
+                        "dataset_task_id": "task_two",
+                        "dataset_task_dir": "/data/task_two",
+                        "dataset_image_tag": "img-two",
                     },
                 ]
             }
         ),
         encoding="utf-8",
     )
-    from harness_evolution.integrations.slime import pipeline
+    from harness_evolution.rl import evolve
 
-    names = pipeline._evidence_task_names(job, mixed_task_attempts=3)
-    catalog = pipeline._evidence_task_catalog(job)
-    assert names.count("task_mixed") == 3
-    assert names.count("task_fail") == 1
-    assert catalog["task_mixed"]["image_tag"] == "img-mixed"
-    assert catalog["task_fail"]["task_dir"] == "/data/task_fail"
+    assert evolve._evidence_task_names(job) == ["task_one", "task_two"]
+    catalog = evolve._evidence_task_catalog(job)
+    assert catalog["task_one"]["image_tag"] == "img-one"
+    assert catalog["task_two"]["task_dir"] == "/data/task_two"
 
 
-def test_pipeline_task_resolution_uses_env_when_config_is_placeholder(
+def test_task_resolution_uses_env_when_config_is_placeholder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from harness_evolution.integrations.slime import pipeline
+    from harness_evolution.rl import evolve
 
     tasks_dir = tmp_path / "tasks"
     job = tmp_path / "tb_job"
@@ -616,12 +616,12 @@ def test_pipeline_task_resolution_uses_env_when_config_is_placeholder(
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setenv("HARNESS_GATE_TASKS_DIR", str(tasks_dir))
-    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    monkeypatch.setattr(evolve.subprocess, "run", fake_run)
 
-    pipeline._resolve_evidence_task_ids(
-        {"work_root": str(tmp_path / "evolution-runs")},
+    evolve._resolve_evidence_task_ids(
         {"heldout_gate": {"tasks_dir": "__TASKS_DIR__"}},
         job,
+        tmp_path / "evolution-runs" / "step000001",
     )
 
     assert len(calls) == 1
@@ -669,21 +669,82 @@ def test_gate_publishes_before_changing_active(tmp_path, monkeypatch, multi, upl
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("candidates, expected", [
-    ([], 1),
-    ([{"evolver_metadata": {"error": "HTTP 404"}}], 1),
-    ([{"evolver_metadata": {}, "validation": {"passed": False}}], 0),
-])
-def test_pipeline_distinguishes_infrastructure_errors_from_rejection(tmp_path, monkeypatch, candidates, expected):
-    from harness_evolution.integrations.slime import pipeline
 
-    config = {"gate_config": "unused", "version_state": str(tmp_path / "state"), "work_root": str(tmp_path)}
-    monkeypatch.setattr(sys, "argv", ["pipeline", "--config", "unused", "--rollout-id", "1"])
-    monkeypatch.setattr(pipeline, "_load_config", lambda *a: config)
-    monkeypatch.setattr(pipeline, "_apply_env_overrides", lambda c: c)
-    monkeypatch.setattr(pipeline, "load_gate_config", lambda *a: {"paths": {}})
-    monkeypatch.setattr(pipeline, "_select_trajectories", lambda *a: None)
-    monkeypatch.setattr(pipeline, "_resolve_evidence_task_ids", lambda *a: None)
-    monkeypatch.setattr(pipeline, "_resolve_active", lambda *a: {"commit": "baseline", "commit_short": "baselin"})
-    monkeypatch.setattr(pipeline, "_run_evolver", lambda *a: {"candidates": candidates})
-    assert pipeline.main() == expected
+
+def test_checked_in_rl_gate_selects_opensandbox():
+    import yaml
+    from harness_evolution.core.paths import harnessrl_root
+    from harness_evolution.evaluation.backends.opensandbox_settings import heldout_backend
+    path = harnessrl_root() / "opencode-baseline/gate_1179.yaml"
+    if not path.is_file():
+        pytest.skip("optional companion harnessRL gate configuration is unavailable")
+    config = yaml.safe_load(path.read_text())
+    assert heldout_backend(config["heldout_gate"]) == "opensandbox"
+
+
+@pytest.mark.parametrize("conversion", ["complete", "incomplete", "exception"])
+@pytest.mark.parametrize("keep_wire", [False, True])
+def test_trial_retains_wire_until_materialization_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conversion: str, keep_wire: bool,
+) -> None:
+    class ArtifactRuntime(FakeRuntime):
+        stopped = False
+
+        async def download_file(self, remote_path, local_path):
+            if "llm-context.jsonl" in remote_path:
+                raise FileNotFoundError(remote_path)
+            await super().download_file(remote_path, local_path)
+
+        async def stop(self):
+            self.stopped = True
+
+    class Harness:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def setup(self, runtime):
+            pass
+
+        def run_steps(self, instruction):
+            return []
+
+    class Evaluator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def evaluate(self, *args, **kwargs):
+            return SimpleNamespace(outcome_reward=1, metadata={})
+
+    async def download_wire(runtime, session_dir, raw_wire_dir):
+        raw_wire_dir.mkdir(parents=True)
+        (raw_wire_dir / "request.json").write_text("original request")
+        return True
+
+    calls = []
+    def convert(session_dir, **kwargs):
+        calls.append(session_dir)
+        if conversion == "exception":
+            raise OSError("conversion unavailable")
+        return {"complete": conversion == "complete"}
+
+    monkeypatch.setenv("HARNESSRL_KEEP_RAW_TRACE_WIRE", "1" if keep_wire else "0")
+    monkeypatch.setattr(opensandbox_gate, "OpenCodeCompatHarness", Harness)
+    monkeypatch.setattr(opensandbox_gate, "OpenSandboxTBVerifierEvaluator", Evaluator)
+    monkeypatch.setattr(opensandbox_gate, "_download_raw_trace_for_materialization", download_wire)
+    monkeypatch.setattr(opensandbox_gate, "materialize_trace_artifacts", convert)
+    settings = opensandbox_settings({"opensandbox": {
+        "agent_gateway_url": "http://fixture", "env_file": "/fixture.env"}})
+    task = resolve_task_spec("retention", tasks_dir=tmp_path,
+        catalog={"retention": {"task_dir": str(_task_dir(tmp_path, "retention"))}})
+    trial = Trial("retention-a0", "candidate-01", "cafe" * 10, "/fixture/bin", task, 0)
+    session = tmp_path / "session"
+    session.mkdir()
+    outcome = asyncio.run(opensandbox_gate._run_trial_once(
+        trial, settings=settings, session_dir=session, runtime_factory=ArtifactRuntime))
+    assert outcome.passed and not outcome.error
+    assert calls == [session]
+    wire = session / "agent/llm-reqs"
+    assert wire.exists() == (keep_wire or conversion != "complete")
+    if wire.exists():
+        assert (wire / "request.json").read_text() == "original request"
+    assert ArtifactRuntime.instances[-1].stopped

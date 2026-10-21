@@ -141,7 +141,7 @@ def test_trace_prompt_documents_source_inputs_outputs_and_file_protocol() -> Non
         }
     )
     assert "OpenCode was used as the harness" in prompt
-    assert "do not assume that the task belongs to the Terminal-Bench" in prompt
+    assert "do not assume that the task belongs to the Terminal-Bench" not in prompt
     assert "HarnessRL" not in prompt
     assert "verifier.txt" not in prompt
     assert "hidden tests" not in prompt
@@ -347,3 +347,31 @@ def test_pattern_limits_are_enforced_by_outcome() -> None:
     assert passed["success_patterns"] == ["s1", "s2", "s3"]
     assert passed["failure_patterns"] == ["f1"]
     assert passed_meta["counts"]["failure_patterns"]["limit"] == 1
+
+
+@pytest.mark.parametrize("phase", ["trace", "aggregate"])
+def test_opencode_analyzer_preserves_configured_env_in_real_subprocess(tmp_path, phase):
+    import sys
+    import shlex
+    script = tmp_path / "capture.py"
+    script.write_text("import os,json; print(json.dumps({k:os.environ.get(k) for k in ['OPENCODE_DISABLE_MODELS_FETCH','OPENCODE_MODELS_PATH','XDG_CACHE_HOME']}))")
+    evidence = PerTraceThenAggregateEvidence.__new__(PerTraceThenAggregateEvidence)
+    configured = {
+        "client_name": "opencode_bun_dev_client",
+        "opencode_repo_path": str(tmp_path),
+        "dev_run_command_prefix": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}",
+        "client_init": {"dev_run_env": {
+            "OPENCODE_DISABLE_MODELS_FETCH": "1",
+            "OPENCODE_MODELS_PATH": str(tmp_path / "models.json"),
+            "XDG_CACHE_HOME": "stale-shared-cache",
+        }},
+    }
+    scoped_cache = str(tmp_path / phase / "cache")
+    client = evidence._build_analyzer_client(configured, {"XDG_CACHE_HOME": scoped_cache})
+    result = client.run_instruction_detailed(workspace=tmp_path, instruction="probe", request_timeout_sec=20)
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "OPENCODE_DISABLE_MODELS_FETCH": "1",
+        "OPENCODE_MODELS_PATH": str(tmp_path / "models.json"),
+        "XDG_CACHE_HOME": scoped_cache,
+    }

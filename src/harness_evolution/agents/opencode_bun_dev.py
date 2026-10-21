@@ -14,6 +14,7 @@ from typing import Any
 
 from harness_evolution.agents.base import BaseClient
 from harness_evolution.agents.registry import CLIENT_REGISTRY
+from harness_evolution.harnesses.opencode.build import bun_command_env
 
 
 @dataclass
@@ -112,15 +113,8 @@ class OpenCodeBunDevClient(BaseClient):
         raise_on_error: bool,
     ) -> OpenCodeDevRunResult:
         command = shlex.split(self.dev_run_command_prefix)
-        run_env = {**os.environ, **self.dev_run_env}
-        configured_bun = str(run_env.get("BUN_BIN") or "").strip()
-        if configured_bun:
-            # A wrapper may invoke Bun by absolute path, but package.json
-            # scripts invoke nested `bun` commands through PATH.
-            bun_dir = str(Path(configured_bun).expanduser().resolve().parent)
-            run_env["PATH"] = os.pathsep.join(
-                item for item in (bun_dir, run_env.get("PATH", "")) if item
-            )
+        # Agent shell tools need the controller's Node/Bun compatibility too.
+        run_env = bun_command_env({**os.environ, **self.dev_run_env})
         if command and Path(command[0]).name == "bun":
             self._ensure_bun_install(self.opencode_repo_path)
         if not self._has_cli_option(command, "--format"):

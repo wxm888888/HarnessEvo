@@ -21,6 +21,7 @@ import copy
 import json
 import os
 import shutil
+import subprocess
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -262,6 +263,20 @@ def _run_two_sided_gate(
     return report
 
 
+def _require_checkout_at(workspace: Path, commit: str) -> None:
+    """The initial harness path is used as the parent worktree as-is: the
+    parent binary is built from it and the first diagnosis/evolver read it.
+    A checkout at any other commit would silently evolve the wrong source."""
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workspace, text=True, capture_output=True, check=False
+    ).stdout.strip()
+    if not (head and commit and head.startswith(commit)):
+        raise SystemExit(
+            f"initial.harness_path {workspace} is checked out at {head or '<not a git checkout>'}, "
+            f"not initial.base_commit {commit}; point harness_path at a worktree of that commit"
+        )
+
+
 def _ensure_parent_binary(gate_config: dict[str, Any], workspace: Path, commit: str, binary: str) -> str:
     if binary and Path(binary).is_file():
         return str(Path(binary).resolve())
@@ -284,6 +299,8 @@ def _persist_parent_binary(run_dir: Path, commit: str, binary: str) -> str:
     if not source.is_file():
         raise RuntimeError(f"cannot persist missing parent binary: {source}")
     destination = run_dir / "parent-binaries" / commit / "opencode"
+    from harness_dist.skills import copy_bundle
+    copy_bundle(source, destination, commit=commit)
     if destination.is_file():
         destination.chmod(destination.stat().st_mode | 0o111)
         return str(destination.resolve())
@@ -303,6 +320,7 @@ def _persist_parent_binary(run_dir: Path, commit: str, binary: str) -> str:
             "commit": commit,
             "source": str(source),
             "binary": str(destination),
+            "skills_bundle": destination.name + ".skills.tar.gz" if destination.with_name(destination.name + ".skills.tar.gz").is_file() else "",
         },
     )
     print(f"[binary] persisted parent {commit[:12]} at {destination}", flush=True)
@@ -853,6 +871,7 @@ def main() -> int:
     else:
         current_workspace = Path(config.initial_harness_path).expanduser().resolve()
         current_commit = config.initial_base_commit
+        _require_checkout_at(current_workspace, current_commit)
         baseline = _resolve_baseline(gate_config)
         current_binary = str(baseline.get("binary_path") or "") if baseline.get("commit") == current_commit else ""
         initial_dir = run_dir / "step-00" / "sampling"

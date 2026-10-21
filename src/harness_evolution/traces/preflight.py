@@ -39,7 +39,6 @@ _INFRA_FAILURE_CLASSES = {
     "verifier_timeout",
     "agent_timeout",
     "verifier_invalid",
-    "verifier_failure",
 }
 
 
@@ -171,8 +170,11 @@ def classify_collection_artifact(artifact: CollectionArtifact) -> PreflightDecis
     if summary is None:
         return _decision(artifact, "invalid_verifier_summary", "verifier-summary.json is invalid")
     summary_status = str(summary.get("status") or "").lower()
-    summary_reward = str(summary.get("reward") or "").lower()
-    if summary_status not in {"ok", "fail"} or summary_reward not in {"0", "1"}:
+    try:
+        summary_reward = float(summary.get("reward"))
+    except (TypeError, ValueError):
+        summary_reward = None
+    if summary_status not in {"ok", "fail"} or summary_reward not in {0.0, 1.0}:
         return _decision(artifact, "verifier_not_executed", "verifier summary does not show a valid execution")
     failure_class = str(summary.get("failure_class") or "").lower()
     if failure_class in _INFRA_FAILURE_CLASSES:

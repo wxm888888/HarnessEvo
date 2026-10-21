@@ -8,6 +8,10 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+_TRACE_RUNTIME = Path(__file__).resolve().parents[1] / "tools" / "session-trace-runtime"
+if str(_TRACE_RUNTIME) not in sys.path:
+    sys.path.insert(0, str(_TRACE_RUNTIME))
+
 from harness_evolution.core.paths import ensure_external_paths  # noqa: E402
 
 ensure_external_paths()

@@ -349,6 +349,9 @@ def polar_payload_to_result(
             # existed.
             "dataset_task_id": payload.get("dataset_task_id"),
             "dataset_task_dir": payload.get("dataset_task_dir"),
+            "dataset_task_file": payload.get("dataset_task_file"),
+            "dataset_task_sha256": payload.get("dataset_task_sha256"),
+            "dataset_mimo_dataset_type": payload.get("dataset_mimo_dataset_type"),
             "dataset_image_tag": payload.get("dataset_image_tag"),
         },
     }
@@ -564,6 +567,11 @@ def convert_rollout(
             {
                 "session_id": session_id,
                 "dataset_task_id": payload.get("dataset_task_id"),
+                "dataset_task_dir": payload.get("dataset_task_dir"),
+                "dataset_task_file": payload.get("dataset_task_file"),
+                "dataset_task_sha256": payload.get("dataset_task_sha256"),
+                "dataset_mimo_dataset_type": payload.get("dataset_mimo_dataset_type"),
+                "dataset_image_tag": payload.get("dataset_image_tag"),
                 "task_id": payload.get("task_id"),
                 "category": session.category,
                 "reward": _number(payload.get("session_reward")),

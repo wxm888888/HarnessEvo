@@ -128,10 +128,15 @@ def _agent_spec(settings: dict[str, Any], trial: Trial) -> AgentSpec:
     model = _agent_model_for_trial(trial, settings)
     if "/" not in model:
         model = f"openai-compatible/{model}"
+    metadata_path = Path(trial.binary).parent / "metadata.json" if trial.binary else None
+    binary_metadata = json.loads(metadata_path.read_text()) if metadata_path and metadata_path.is_file() else {}
     return AgentSpec(
         import_path="terminal_bench_opensandbox.opencode_compat:OpenCodeCompatHarness",
         model_name=model,
         settings={
+            "opencode_skills_bundle": str(Path(trial.binary).with_name(Path(trial.binary).name + ".skills.tar.gz")) if trial.binary else "",
+            "opencode_skills_commit": trial.commit,
+            "opencode_require_skills_bundle": bool(binary_metadata.get("skills_bundle")),
             "opencode_context_limit": settings["context_limit"],
             "opencode_output_limit": settings["output_limit"],
             "opencode_base_url": f"{settings['agent_gateway_url'].rstrip('/')}/v1",
@@ -179,7 +184,7 @@ async def _run_trial_once(
             # whole gate after the command budget has expired.
             result: ExecResult = await asyncio.wait_for(
                 runtime.exec(
-                    step.command,
+                    mimo_backend.agent_command(step.command) if mimo_task is not None else step.command,
                     cwd=step.cwd or workdir,
                     env=step.env,
                     timeout_sec=agent_timeout,
@@ -256,113 +261,118 @@ async def _run_trial_once(
         # This is especially useful when runtime.exec raises on timeout and no
         # ExecResult is available to persist above. Artifact collection must
         # never turn an otherwise valid trial into an infrastructure error.
-        download_file = getattr(runtime, "download_file", None)
-        if callable(download_file) and not gate_timed_out:
-            agent_dir = session_dir / "agent"
-            agent_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                await download_file(
-                    "/logs/agent/opencode.txt", str(session_dir / "agent.remote.jsonl")
-                )
-            except Exception as exc:  # noqa: BLE001
-                _log(f"artifact {trial.trial_id} agent log unavailable: {exc}")
-            try:
-                debug_errors: list[str] = []
-                for remote_debug in (
-                    "/polar/session/logs/agent/trace-debug.txt",
-                    "/logs/agent/trace-debug.txt",
-                ):
+        try:
+            download_file = getattr(runtime, "download_file", None)
+            if callable(download_file) and not gate_timed_out:
+                if not _gate_timeout_requested(settings):
+                    agent_dir = session_dir / "agent"
+                    agent_dir.mkdir(parents=True, exist_ok=True)
                     try:
-                        await download_file(remote_debug, str(agent_dir / "trace-debug.txt"))
-                        break
-                    except Exception as debug_exc:  # noqa: BLE001
-                        debug_errors.append(f"{remote_debug}: {debug_exc}")
-                else:
-                    raise RuntimeError("; ".join(debug_errors))
-            except Exception as exc:  # noqa: BLE001
-                _log(f"artifact {trial.trial_id} trace debug unavailable: {exc}")
-            try:
-                for remote_log in (
-                    "/logs/agent/trace-proxy.log",
-                    "/logs/agent/trace-proxy-status.json",
-                ):
-                    try:
-                        await download_file(remote_log, str(agent_dir / Path(remote_log).name))
-                    except Exception as log_exc:  # noqa: BLE001
-                        _log(f"artifact {trial.trial_id} trace proxy log unavailable: {log_exc}")
-                raw_wire_dir = agent_dir / "llm-reqs"
-                keep_raw_wire = _keep_raw_trace_wire()
-                context_downloaded = False
-                context_errors: list[str] = []
-                for remote_context in (
-                    "/tmp/polar-opencode-trace/llm-context.jsonl",
-                    "/polar/session/logs/agent/llm-context.jsonl",
-                    "/logs/agent/llm-context.jsonl",
-                ):
-                    try:
-                        await download_file(remote_context, str(agent_dir / "llm-context.jsonl"))
-                        context_downloaded = True
-                        break
-                    except Exception as context_exc:  # noqa: BLE001
-                        context_errors.append(f"{remote_context}: {context_exc}")
-                # Most images do not publish the normalized context file. In
-                # that case, fetch the proxy wire temporarily so the local
-                # materializer can reconstruct it from request metadata and
-                # streamed responses. Explicit debug mode keeps the same raw
-                # files after materialization; normal runs remove them below.
-                raw_wire_available = False
-                if keep_raw_wire or not context_downloaded:
-                    if not context_downloaded:
-                        _log(
-                            f"artifact {trial.trial_id} normalized context unavailable; "
-                            "temporarily downloading raw trace wire for materialization"
+                        await download_file(
+                            "/logs/agent/opencode.txt", str(session_dir / "agent.remote.jsonl")
                         )
-                    raw_wire_available = await _download_raw_trace_for_materialization(
-                        runtime,
-                        session_dir,
-                        raw_wire_dir,
-                    )
-                if not context_downloaded and not raw_wire_available:
-                    # A sandbox/control-plane failure can prevent both the
-                    # normalized context and the temporary raw fallback from
-                    # being downloaded. Keep the trial result for operations,
-                    # but let materialize_trace_artifacts mark the evidence
-                    # incomplete so preflight excludes it from evolution.
-                    _log(
-                        f"artifact {trial.trial_id} normalized context unavailable; "
-                        f"recording incomplete trace ({'; '.join(context_errors)})"
-                    )
+                    except Exception as exc:  # noqa: BLE001
+                        _log(f"artifact {trial.trial_id} agent log unavailable: {exc}")
+                    try:
+                        debug_errors: list[str] = []
+                        for remote_debug in (
+                            "/polar/session/logs/agent/trace-debug.txt",
+                            "/logs/agent/trace-debug.txt",
+                        ):
+                            try:
+                                await download_file(remote_debug, str(agent_dir / "trace-debug.txt"))
+                                break
+                            except Exception as debug_exc:  # noqa: BLE001
+                                debug_errors.append(f"{remote_debug}: {debug_exc}")
+                        else:
+                            raise RuntimeError("; ".join(debug_errors))
+                    except Exception as exc:  # noqa: BLE001
+                        _log(f"artifact {trial.trial_id} trace debug unavailable: {exc}")
+                    try:
+                        for remote_log in (
+                            "/logs/agent/trace-proxy.log",
+                            "/logs/agent/trace-proxy-status.json",
+                        ):
+                            try:
+                                await download_file(remote_log, str(agent_dir / Path(remote_log).name))
+                            except Exception as log_exc:  # noqa: BLE001
+                                _log(f"artifact {trial.trial_id} trace proxy log unavailable: {log_exc}")
+                        raw_wire_dir = agent_dir / "llm-reqs"
+                        keep_raw_wire = _keep_raw_trace_wire()
+                        context_downloaded = False
+                        context_errors: list[str] = []
+                        for remote_context in (
+                            "/tmp/polar-opencode-trace/llm-context.jsonl",
+                            "/polar/session/logs/agent/llm-context.jsonl",
+                            "/logs/agent/llm-context.jsonl",
+                        ):
+                            try:
+                                await download_file(remote_context, str(agent_dir / "llm-context.jsonl"))
+                                context_downloaded = True
+                                break
+                            except Exception as context_exc:  # noqa: BLE001
+                                context_errors.append(f"{remote_context}: {context_exc}")
+                        # Most images do not publish the normalized context file. In
+                        # that case, fetch the proxy wire temporarily so the local
+                        # materializer can reconstruct it from request metadata and
+                        # streamed responses. Explicit debug mode keeps the same raw
+                        # files after materialization; normal runs remove them below.
+                        raw_wire_available = False
+                        if keep_raw_wire or not context_downloaded:
+                            if not context_downloaded:
+                                _log(
+                                    f"artifact {trial.trial_id} normalized context unavailable; "
+                                    "temporarily downloading raw trace wire for materialization"
+                                )
+                            raw_wire_available = await _download_raw_trace_for_materialization(
+                                runtime,
+                                session_dir,
+                                raw_wire_dir,
+                            )
+                        if not context_downloaded and not raw_wire_available:
+                            # A sandbox/control-plane failure can prevent both the
+                            # normalized context and the temporary raw fallback from
+                            # being downloaded. Keep the trial result for operations,
+                            # but let materialize_trace_artifacts mark the evidence
+                            # incomplete so preflight excludes it from evolution.
+                            _log(
+                                f"artifact {trial.trial_id} normalized context unavailable; "
+                                f"recording incomplete trace ({'; '.join(context_errors)})"
+                            )
+                        materialization_complete = False
+                        try:
+                            trace_materialization = materialize_trace_artifacts(
+                                session_dir,
+                                reward="missing" if (not verifier_ran and detail) else ("1" if passed else "0"),
+                                status="ok" if verifier_ran else "error",
+                                error=detail or None,
+                                extra_meta={
+                                    "verifier_rc": 0 if verifier_ran else None,
+                                    "trace_capture_mode": (
+                                        "portable-proxy-context"
+                                        if context_downloaded
+                                        else ("portable-proxy-raw-wire" if raw_wire_available else "unavailable")
+                                    ),
+                                },
+                            )
+                            materialization_complete = bool(trace_materialization.get("complete"))
+                        finally:
+                            # The raw wire is only a transport-level fallback.  Keep
+                            # the normalized evidence and remove request/response
+                            # payloads only after the OpenAI exports have been validated.
+                            if raw_wire_dir.is_dir() and not keep_raw_wire and materialization_complete:
+                                shutil.rmtree(raw_wire_dir, ignore_errors=True)
+                                _log(f"artifact {trial.trial_id} removed temporary raw trace wire")
+                    except Exception as exc:  # noqa: BLE001
+                        _log(f"artifact {trial.trial_id} full context unavailable: {exc}")
+        finally:
+            if _gate_timeout_requested(settings):
+                _log(f"gate timeout {trial.trial_id}: skipping artifact collection; outer gate is stopping runtime")
+            else:
                 try:
-                    materialize_trace_artifacts(
-                        session_dir,
-                        reward="missing" if (not verifier_ran and detail) else ("1" if passed else "0"),
-                        status="ok" if verifier_ran else "error",
-                        error=detail or None,
-                        extra_meta={
-                            "verifier_rc": 0 if verifier_ran else None,
-                            "trace_capture_mode": (
-                                "portable-proxy-context"
-                                if context_downloaded
-                                else ("portable-proxy-raw-wire" if raw_wire_available else "unavailable")
-                            ),
-                        },
-                    )
-                finally:
-                    # The raw wire is only a transport-level fallback.  Keep
-                    # the normalized evidence and remove request/response
-                    # payloads even when materialization itself fails.
-                    if raw_wire_dir.is_dir() and not keep_raw_wire:
-                        shutil.rmtree(raw_wire_dir, ignore_errors=True)
-                        _log(f"artifact {trial.trial_id} removed temporary raw trace wire")
-            except Exception as exc:  # noqa: BLE001
-                _log(f"artifact {trial.trial_id} full context unavailable: {exc}")
-        if gate_timed_out:
-            _log(f"gate timeout {trial.trial_id}: skipping artifact collection; outer gate is stopping runtime")
-        else:
-            try:
-                await runtime.stop()
-            except Exception as exc:  # noqa: BLE001
-                _log(f"trial {trial.trial_id} stop failed: {exc}")
+                    await runtime.stop()
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"trial {trial.trial_id} stop failed: {exc}")
 
 
 def _infrastructure_error_type(detail: str) -> str:

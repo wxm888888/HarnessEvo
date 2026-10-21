@@ -161,7 +161,7 @@ hevo evolve --config evolve.yaml --job-dir /path/to/held-in-job --rollouts 1
 |---|---|
 | `hevo loop ...` | 主循环，使用原始命令行参数（`hevo run` 就是用 run.yaml 拼出这些参数） |
 | `hevo gate ...` | 对单个候选 worktree 跑静态检查和 held-out 评测 |
-| `hevo slime-pipeline ...` | slime 训练暂停时调用的一步协同进化 |
+| `hevo rl-round --config rl_evolve.yaml` | RL 训练暂停时调用的一轮协同进化（等价于 `python -m harness_evolution.rl`） |
 | `hevo <命令> --help` | 查看对应模块的参数 |
 
 ## 5. 配置说明

@@ -124,6 +124,7 @@ class MimoFakeRuntime:
         self.commands: list[str] = []
         self.uploaded: dict[str, bytes] = {}
         self.homes: dict[str, str | None] = {}
+        self.capped: dict[str, bool] = {}
         type(self).instances.append(self)
 
     async def start(self) -> None:
@@ -142,6 +143,10 @@ class MimoFakeRuntime:
         Path(local_path).write_text("", encoding="utf-8")
 
     async def exec(self, command: str, env: dict | None = None, **_: object) -> ExecResult:
+        prefix = mimo.cpu_limit_prefix()
+        capped = command.startswith(prefix)
+        command = command[len(prefix):] if capped else command
+        self.capped[command] = capped
         self.commands.append(command)
         self.homes[command] = (env or {}).get("HOME", self.spec.env.get("HOME"))
         if "HIDDEN_VERIFIER_ABSENT" in command:
@@ -207,6 +212,12 @@ def test_mimo_code_trial_runs_hidden_verifier(tmp_path: Path, verifier_rc: int, 
     assert runtime.homes[runtime.commands[agent_index]] == mimo.MIMO_HOME
     assert runtime.homes["bash /tmp/mimo-verify.sh"] == "/root"
     assert runtime.homes[runtime.commands[apply_index]] == "/root"
+    # Thread caps (the sandbox reports the host's CPU count) apply to the
+    # agent and the verifier, and the CPU-count hooks are uploaded first.
+    assert runtime.capped[runtime.commands[agent_index]] and runtime.capped["bash /tmp/mimo-verify.sh"]
+    assert "OMP_NUM_THREADS=2" in mimo.cpu_limit_prefix()
+    assert "os.cpu_count" in runtime.uploaded["/tmp/mimo-cpu/sitecustomize.py"].decode()
+    assert "/tmp/mimo-cpu-limit.cjs" in runtime.uploaded
     assert runtime.uploaded["/tmp/mimo-hidden.patch"].decode() == TEST_PATCH
     assert "pytest -q tests/test_x.py" in runtime.uploaded["/tmp/mimo-verify.sh"].decode()
     assert (session / "agent" / "model.diff").read_text(encoding="utf-8").startswith("diff --git")

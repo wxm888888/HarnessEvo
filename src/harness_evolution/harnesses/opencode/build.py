@@ -7,6 +7,7 @@ import platform
 import shutil
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
@@ -57,9 +58,19 @@ def _configured_bun_bin(config: RuntimeConfig) -> Path | None:
     return path if path.is_file() else None
 
 
-def _command_env(config: RuntimeConfig, extra: dict[str, str] | None = None) -> dict[str, str]:
-    env = os.environ.copy()
-    bun_bin = _configured_bun_bin(config)
+def bun_command_env(env: dict[str, str], bun_bin: Path | None = None) -> dict[str, str]:
+    """Prepare the same JS runtime for agent tools and controller checks.
+
+    tsgo's JS launcher catches a missing import.meta.resolve API on Node 16
+    and reports the installed native package as missing. Use Bun as node only
+    when the inherited Node cannot run that launcher. Child shells inherit
+    this PATH, including Bun's additional node_modules/.bin entries.
+    """
+    env = dict(env)
+    if bun_bin is None and env.get("BUN_BIN"):
+        configured = Path(env["BUN_BIN"]).expanduser()
+        if configured.is_file():
+            bun_bin = configured
     if bun_bin is None:
         discovered_bun = shutil.which("bun", path=env.get("PATH"))
         bun_bin = Path(discovered_bun) if discovered_bun else None
@@ -89,7 +100,7 @@ def _command_env(config: RuntimeConfig, extra: dict[str, str] | None = None) -> 
             )
             node_compatible = probe.returncode == 0
         if not node_compatible:
-            shim_dir = Path(os.environ.get("TMPDIR") or "/tmp") / "harnessrl-bun-node-shim"
+            shim_dir = Path(env.get("TMPDIR") or "/tmp") / "harnessrl-bun-node-shim"
             shim_dir.mkdir(parents=True, exist_ok=True)
             shim = shim_dir / "node"
             if shim.is_symlink() and shim.resolve(strict=False) != bun_bin.resolve():
@@ -100,9 +111,16 @@ def _command_env(config: RuntimeConfig, extra: dict[str, str] | None = None) -> 
                 except FileExistsError:
                     pass
             env["PATH"] = f"{shim_dir}{os.pathsep}{env.get('PATH', '')}"
+    return env
+
+
+
+def _command_env(config: RuntimeConfig, extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = bun_command_env(os.environ.copy(), _configured_bun_bin(config))
     if extra:
         env.update(extra)
     return env
+
 
 
 def ensure_bun_install(opencode_repo_path: Path, env: dict[str, str] | None = None) -> None:
@@ -294,7 +312,38 @@ def link_shared_node_modules(workspace: Path, source_repo: Path) -> list[str]:
             _copy_node_modules_tree(cached, target)
         _relink_workspace_members(target, workspace, workspace_member_links)
         linked.append(relative)
+    _settle_native_optional_dependencies(workspace)
     return linked
+
+
+def _settle_native_optional_dependencies(workspace: Path) -> None:
+    """Wait for platform-specific optional packages to resolve after cloning.
+
+    bun installs each native/platform package (e.g. tsgo's
+    ``@typescript/native-preview-<platform>-<arch>``) through a chain of
+    symlinks nested inside ``node_modules/.bun``.  ``cp -al`` hardlinks the
+    whole ``node_modules`` tree in one call and returns only once that call
+    exits, but on GPFS the directory entries it just created are not always
+    immediately visible to a *different* process's Node-style
+    ``import.meta.resolve`` walk -- the walk can briefly see a broken link
+    and raise ``Unable to resolve ...`` even though every symlink is already
+    on disk and correct.  Retrying a cheap existence check a few times lets
+    that window pass before the evolver agent gets a chance to run
+    `bun run typecheck` and treat the transient failure as a real error.
+    """
+    for pattern in ("@typescript/native-preview-*",):
+        for candidate in workspace.glob(f"node_modules/{pattern}"):
+            if not candidate.is_symlink() and not candidate.exists():
+                continue
+            for attempt in range(10):
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    if (resolved / "lib").exists() or any(resolved.iterdir()):
+                        break
+                except (FileNotFoundError, NotADirectoryError, OSError):
+                    pass
+                time.sleep(0.5)
+
 
 
 def _git_head_commit(repo_path: Path) -> str:
@@ -319,8 +368,13 @@ def register_built_binary(config: RuntimeConfig, opencode_repo_path: Path, binar
     commit produced the binary sitting at that path, so a second build (e.g.
     for a different candidate, or a rebuild of the same commit later) makes
     the earlier artifact unrecoverable. Every entry is keyed by
-    (commit, build recipe) so re-registering the same combination is a no-op
-    instead of a redundant copy.
+    (commit, build recipe).
+
+    Bun embeds a build timestamp and randomized chunk names, so rebuilding an
+    unchanged commit is not byte-for-byte reproducible. AFS publication is
+    intentionally immutable at the commit path. Keep the first complete
+    registry artifact for a key so a gate retry publishes the same bytes
+    instead of conflicting with its own earlier upload.
     """
     commit = _git_head_commit(opencode_repo_path)
     recipe = {
@@ -332,16 +386,8 @@ def register_built_binary(config: RuntimeConfig, opencode_repo_path: Path, binar
     entry_dir = registry_root / f"{commit}-{recipe_fingerprint}"
     registered_binary = entry_dir / binary.name
     metadata_path = entry_dir / "metadata.json"
-    # The source checkout can be amended while keeping the same harness
-    # commit during a smoke/debug cycle.  Do not silently reuse an older
-    # artifact in that case; the dist binary is the source of truth for this
-    # build invocation.
-    stale = (
-        not registered_binary.exists()
-        or registered_binary.stat().st_size != binary.stat().st_size
-        or binary.stat().st_mtime_ns > registered_binary.stat().st_mtime_ns
-    )
-    if stale:
+    missing = not registered_binary.is_file() or registered_binary.stat().st_size == 0
+    if missing:
         entry_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(binary, registered_binary)
         registered_binary.chmod(registered_binary.stat().st_mode | 0o111)
@@ -361,6 +407,12 @@ def register_built_binary(config: RuntimeConfig, opencode_repo_path: Path, binar
             + "\n",
             encoding="utf-8",
         )
+    from harness_dist.skills import write_bundle
+    archive = write_bundle(opencode_repo_path, registered_binary, commit)
+    metadata = json.loads(metadata_path.read_text())
+    metadata["skills_bundle"] = archive.name
+    metadata["skills_commit"] = commit
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
     return registered_binary
 
 
@@ -420,10 +472,14 @@ def resolve_local_opencode_binary(config: RuntimeConfig, current_harness_path: s
     if config.build.get("source_binary_relative_path"):
         candidate = path / str(config.build["source_binary_relative_path"])
         if candidate.is_file() and os.access(candidate, os.X_OK):
+            from harness_dist.skills import write_bundle
+            write_bundle(path, candidate, _git_head_commit(path))
             return candidate.resolve()
     if not _bool_value(config.build, "build_for_tb", True):
         existing = path / "packages" / "opencode" / "dist" / _current_binary_name()
         if existing.is_file() and os.access(existing, os.X_OK):
+            from harness_dist.skills import write_bundle
+            write_bundle(path, existing, _git_head_commit(path))
             return existing.resolve()
         raise RuntimeError(f"build.build_for_tb is false but no binary was found at {existing}")
     return build_opencode_binary_from_source(config, path)

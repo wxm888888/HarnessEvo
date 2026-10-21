@@ -94,6 +94,21 @@ static char *find_header_value(char *headers, const char *name) {
     return NULL;
 }
 
+static void session_header(char *headers, const char *name, char *dest, size_t cap) {
+    dest[0] = '\0';
+    const char *value = find_header_value(headers, name);
+    if (!value) return;
+    size_t length = strcspn(value, "\r\n");
+    while (length && (value[length - 1] == ' ' || value[length - 1] == '\t')) length--;
+    if (!length || length >= cap) return;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)value[i];
+        if (!(isalnum(c) || c == '_' || c == '-' || c == '.' || c == ':')) return;
+    }
+    memcpy(dest, value, length);
+    dest[length] = '\0';
+}
+
 static long long header_length(char *headers) {
     char *value = find_header_value(headers, "Content-Length");
     if (!value) return -1;
@@ -288,11 +303,11 @@ static int proxy_body(int upstream, int client, char *response_headers, size_t r
 }
 
 static void write_meta(const char *path, int n, const char *method, const char *request_path,
-                       int status, int stream) {
+                       int status, int stream, const char *session_id, const char *parent_session_id) {
     FILE *file = fopen(path, "w");
     if (!file) return;
-    fprintf(file, "{\"n\":%d,\"method\":\"%s\",\"path\":\"%s\",\"status\":%d,\"stream\":%s}\n",
-            n, method, request_path, status, stream ? "true" : "false");
+    fprintf(file, "{\"n\":%d,\"method\":\"%s\",\"path\":\"%s\",\"status\":%d,\"stream\":%s,\"session_id\":\"%s\",\"parent_session_id\":\"%s\"}\n",
+            n, method, request_path, status, stream ? "true" : "false", session_id, parent_session_id);
     fclose(file);
 }
 
@@ -302,6 +317,11 @@ static int handle_client(int client, const char *upstream_url, const char *outdi
     if (read_headers(client, request_headers, sizeof(request_headers), &request_len) < 0) return -1;
     char method[32], request_path[2048];
     extract_request_line(request_headers, method, sizeof(method), request_path, sizeof(request_path));
+    char session_id[256], parent_session_id[256];
+    session_header(request_headers, "X-Session-Id", session_id, sizeof(session_id));
+    if (!session_id[0]) session_header(request_headers, "x-opencode-session", session_id, sizeof(session_id));
+    if (!session_id[0]) session_header(request_headers, "x-session-affinity", session_id, sizeof(session_id));
+    session_header(request_headers, "x-parent-session-id", parent_session_id, sizeof(parent_session_id));
     long long content_length = header_length(request_headers);
     if (content_length < 0) content_length = 0;
     if (content_length > 64LL * 1024 * 1024) return -1;
@@ -387,7 +407,7 @@ static int handle_client(int client, const char *upstream_url, const char *outdi
         fclose(capture_file);
         if (rc == 0) {
             rename(tmp_path, final_path);
-            write_meta(meta_path, n, method, request_path, status, stream);
+            write_meta(meta_path, n, method, request_path, status, stream, session_id, parent_session_id);
         } else unlink(tmp_path);
     }
     close(upstream);
@@ -396,8 +416,19 @@ static int handle_client(int client, const char *upstream_url, const char *outdi
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGTERM, stop_signal);
-    signal(SIGINT, stop_signal);
+    /*
+     * signal() may install handlers with SA_RESTART, which leaves accept()
+     * blocked after SIGTERM until another client happens to connect.  The
+     * rollout wrapper waits for this process during teardown, so that race
+     * turns an already-complete sample into an agent timeout.  Use sigaction
+     * without SA_RESTART so the stop signal reliably interrupts accept().
+     */
+    struct sigaction stop_action;
+    memset(&stop_action, 0, sizeof(stop_action));
+    stop_action.sa_handler = stop_signal;
+    sigemptyset(&stop_action.sa_mask);
+    if (sigaction(SIGTERM, &stop_action, NULL) < 0 ||
+        sigaction(SIGINT, &stop_action, NULL) < 0) return 5;
     const char *upstream = getenv("TRACE_PROXY_UPSTREAM");
     const char *outdir = getenv("TRACE_PROXY_OUTDIR");
     const char *port_text = getenv("TRACE_PROXY_PORT");
@@ -443,7 +474,7 @@ int main(void) {
     while (!stopping) {
         int client = accept(server, NULL, NULL);
         if (client < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR && !stopping) continue;
             break;
         }
         handle_client(client, upstream, outdir);

@@ -34,6 +34,11 @@ def _codex_client_env(
     process alone is insufficient.  BASH_ENV is sourced by non-interactive
     Bash after its startup files and restores the prepared PATH for both
     login and ordinary command shells.
+
+    The script must merge into the PATH the shell already has instead of
+    overwriting it: Bun prepends ``node_modules/.bin`` when it runs a package
+    script, and a plain ``export PATH=...`` would drop it (``tsgo: command not
+    found``, exit 127) whenever Bash decides to honor BASH_ENV.
     """
     prepared = _command_env(config)
     env = {str(key): str(value) for key, value in (existing or {}).items()}
@@ -47,7 +52,17 @@ def _codex_client_env(
         temporary = shell_env.with_suffix(f".tmp-{os.getpid()}")
         temporary.write_text(
             f"export BUN_BIN={shlex.quote(env['BUN_BIN'])}\n"
-            f"export PATH={shlex.quote(env['PATH'])}\n",
+            f"__hr_path={shlex.quote(env['PATH'])}\n"
+            "__hr_ifs=$IFS; IFS=:\n"
+            "for __hr_dir in $PATH; do\n"
+            "  case \":$__hr_path:\" in\n"
+            "    *\":$__hr_dir:\"*) ;;\n"
+            "    *) [ -n \"$__hr_dir\" ] && __hr_path=\"$__hr_path:$__hr_dir\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "IFS=$__hr_ifs\n"
+            "export PATH=$__hr_path\n"
+            "unset __hr_path __hr_ifs __hr_dir\n",
             encoding="utf-8",
         )
         temporary.replace(shell_env)
@@ -129,6 +144,8 @@ def _prepare_opencode_evolver_environment(config: RuntimeConfig, run_id: str) ->
             },
         }
     generated = {
+        "permission": {"external_directory": "deny"},
+        "experimental": {"continue_loop_on_deny": True},
         "model": model,
         "enabled_providers": [provider_id],
         "provider": {
@@ -485,12 +502,7 @@ def generate_candidate_batch(
             agent_trajectory = []
         return candidate, {candidate.commit: agent_trajectory}, _candidate_to_json(candidate)
 
-    max_workers = max(1, int(config.rollouts_per_attempt))
-    results_by_idx: dict[int, tuple[Candidate, dict[str, list[dict[str, Any]]], dict[str, Any]]] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_run_one_rollout, idx): idx for idx in range(config.rollouts_per_attempt)}
-        for fut in as_completed(futures):
-            results_by_idx[futures[fut]] = fut.result()
+    results_by_idx = _collect_rollout_results(_run_one_rollout, config.rollouts_per_attempt)
 
     for rollout_idx in range(config.rollouts_per_attempt):
         candidate, trajectory_entry, rollout_json = results_by_idx[rollout_idx]
@@ -498,6 +510,21 @@ def generate_candidate_batch(
         trajectories.append(trajectory_entry)
         meta["rollouts"].append(rollout_json)
     return candidates, trajectories, meta
+
+
+def _collect_rollout_results(run_one, rollout_count: int) -> dict[int, Any]:
+    """Run all candidates with a separate, optionally bounded worker count."""
+    concurrency = int(os.environ.get("HARNESSRL_EVOLVER_CONCURRENCY", str(max(1, rollout_count))))
+    if concurrency < 1:
+        raise ValueError("HARNESSRL_EVOLVER_CONCURRENCY must be positive")
+    max_workers = min(max(1, rollout_count), concurrency)
+    print(f"[proposer] candidates={rollout_count} concurrency={max_workers}", flush=True)
+    results: dict[int, Any] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(run_one, index): index for index in range(rollout_count)}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return results
 
 
 def _candidate_to_json(candidate: Candidate) -> dict[str, Any]:

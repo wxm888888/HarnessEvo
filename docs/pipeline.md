@@ -1,439 +1,146 @@
-# HarnessRL 进化实验 Pipeline 手册
+# RL harness 进化流水线
 
-本文定义 HarnessRL 在 Terminal-Bench 2.1 和 TMAX 上进行“采样 → 诊断 → 汇总 → harness 改进 → 编译 → 动态 gate → 下一轮”的统一流程。
-
-所有新实验的结果、轨迹、日志、状态、候选工作区和二进制都写入 GPFS2：
-
-```text
-/mnt/shared-storage-gpfs2/safewt-share02/sunyoubang/yuanjiarui/wangxianghe/
-```
-
-不要把新的实验结果写入 `/mnt/shared-storage-user/yuanjiarui-p/wxh`。代码和只读配置可以从 wxh 或 dcy 读取，但每个实验必须使用 GPFS2 下独立的 `RUN_ROOT`。
-
-## 1. 实验目标和数据划分
-
-每一轮有两个用途不同的数据集：
-
-- **Held-in：32 个新的 TMAX 题目**。只用于采样、逐轨迹诊断、跨轨迹汇总和 harness 进化。每轮换一批题目，不因为候选晋级与否而重复上一轮的题目。
-- **Held-out：完整的 89 个 TB2.1 题目**。只用于候选 gate 和最终比较，不作为进化模型的输入。
-
-晋级只根据 89 个 held-out TB2.1 题目的结果。held-in 分数可以记录和分析，但不能代替 held-out gate 分数。
-
-推荐的循环关系：
-
-```text
-当前 parent harness
-       │
-       ├── 32 个新的 TMAX held-in → 轨迹诊断和汇总 → 生成 N 个候选
-       │
-       └── 完整 89 个 TB2.1 held-out → baseline/candidate gate
-                                      │
-                    最高且满足约束的候选成为下一轮 parent
-                                      │
-                         下一轮重新抽取 32 个 TMAX
-```
-
-候选数必须是可调参数，通常使用 2；不要把候选数量写死在代码里。
-
-## 2. 推荐目录布局
-
-```text
-$RUN_ROOT/
-├── manifest.json
-├── console.log
-├── configs/
-│   ├── evolution.yaml
-│   ├── gate.yaml
-│   └── held-out-89.json
-├── held-in-schedule.json
-├── state.json
-├── step-00/
-│   ├── sampling/
-│   ├── diagnosis/
-│   └── baseline/
-├── step-01/
-│   ├── sampling/
-│   ├── diagnosis/
-│   ├── candidates/
-│   ├── gate-reports/
-│   ├── gate.json
-│   └── step.json
-└── logs/
-```
-
-每一轮都应该有独立的 `step-XX`，不要覆盖上一轮的轨迹或 gate 结果。候选源码工作区和 Bun 二进制也放在 GPFS2。
-
-## 3. 阶段 A：实验前检查
-
-启动前固定记录：
-
-- parent harness 的完整 commit 和二进制路径；
-- 模型 endpoint、replica 列表和端口；
-- TMAX catalog、TB2.1 catalog 和 task 数量；
-- agent timeout、verifier timeout 和重试次数；
-- OpenSandbox API、capacity scope、run id 和本地容量账本目录；
-- 采样并发、候选数量、gate 并发和统一 sandbox 创建池；
-- 当前代码版本、配置文件 checksum 和 Python 环境。
-
-必须确认：
+本文描述当前训练接入。旧的独立 pipeline 已删除；训练触发的一轮进化只有一个入口：
 
 ```bash
-# TMAX catalog
-/mnt/shared-storage-user/yuanjiarui-p/duchenyu/tmax-hamishivi/tmax_hamishivi_all_4487.jsonl
-
-# TB2.1 catalog
-/mnt/shared-storage-user/yuanjiarui-p/wxh/tb21-eval-qwen36-fixed/data/tb21_polar_pjlab_images.jsonl
+python -m harness_evolution.rl --config /path/to/rl_evolve.yaml
 ```
 
-在真正跑 32/89 题之前先做一个 sandbox smoke test，确认创建、命令执行、verifier 和删除都成功。模型 endpoint 也要先检查四个 replica 是否可达。
+`trainer/src/trainer/evolve.py` 只负责在整步边界暂停训练、执行上面的命令并检查退出码。证据挑选、候选生成、门控、发布和版本状态更新都在 `harness_evolution.rl` 内完成。
 
-## 4. 阶段 B：采样 baseline 和 held-in 轨迹
+## 1. 一轮发生什么
 
-每个 trial 的实际顺序是：
+```text
+训练完成 step N
+  -> 从最近 rollout dump 挑选失败/成功轨迹
+  -> 拼接 agent-artifacts 并做 preflight
+  -> 诊断证据、生成候选 commit
+  -> 静态 gate（typecheck/build/smoke）
+  -> dynamic 模式下做 parent/candidate OpenSandbox A/B
+  -> ACCEPT：持久化 candidate commit、发布二进制、记录 memory、promote version_state
+     REJECT：记录拒绝，继续使用 parent
+  -> step N+1 的 sandbox 启动时重读 version_state
+```
 
-1. 创建 sandbox；
-2. 上传任务目录和 verifier 所需文件；
-3. 安装当前 parent harness 二进制；
-4. 启动 OpenCode；
-5. 通过 OpenAI-compatible endpoint 请求模型；
-6. 保存请求上下文和 OpenCode 事件；
-7. agent 阶段结束后执行 verifier；
-8. 保存通过、失败、超时或基础设施错误；
-9. 删除 sandbox，并确认删除结果。
+关键边界：
 
-agent timeout 和 verifier timeout 是两个阶段。agent 超时后仍然进入 verifier；只有整个 sandbox 生命周期或控制面失败，才记为 infrastructure error。基础设施错误应按统一策略重试，不能静默转换成普通失败。
+- `HARNESS_VERSION_STATE` 是运行中 harness commit 的唯一真相。新血统由 `HARNESS_BASELINE_COMMIT` 初始化；下一步 sandbox 从 `{OPENCODE_AFS_ROOT}/{commit7}/opencode` 安装。
+- `select_evidence` 同时读取 `rollout_XXXXXX/*.json` 和同根目录下的 `agent-artifacts/<session_id>/`。缺少完整消息、工具 schema 或有效 verifier 结果的轨迹不会进入进化器。
+- memory 完全由 evolve 配置管理。只有最终晋升的候选才追加 `accepted_lineage`；训练器不读写 memory。
+- `gate_mode: static_only` 只适合接线 smoke。生产验收使用 `dynamic`，按同任务 parent/candidate 的 net wins 判定。
+- ACCEPT 的候选必须先 fetch/tag 到持久 baseline repo，再发布到 AFS，最后写入 version state。持久化或发布失败会写入 gate report 并终止本轮，不能返回 ACCEPT。
+- 普通 async/lookahead 在触发进化的 step 暂停 N+1 预取，等待进化完成后再采样；其他 step 保留预取。当前不支持与 async carryover、nbank disk、rolling weights 同时启用进化，启动时会明确报错。
 
-baseline 可以复用，但复用前必须检查：
+## 2. 训练接线
 
-- task 集合完全相同；
-- parent commit 和模型 endpoint 相同；
-- timeout、重试和 verifier 配置相同；
-- 轨迹文件和结果文件没有被截断；
-- 复用路径写入 `manifest.json` 和 `state.json`。
+启动脚本通常自动生成命令；手工接线的最小形态如下：
 
-如果任一项不一致，应重新采样 baseline。
+```bash
+export HARNESS_EVOLVE_INTERVAL=40
+export HARNESS_EVOLVE_CMD="python -m harness_evolution.rl --config $HARNESS_EVOLVE_CONFIG"
+export HARNESS_VERSION_STATE="$RUN_ROOT/harness_version_state.json"
+export HARNESS_BASELINE_COMMIT=5c23e88419c4743b9be42cea132f2fb1e6cb63ff
+export POLAR_TRAJECTORY_DIR="$RUN_ROOT/trajectories"
+export OPENCODE_AFS_ROOT=/sandbox-data/duchenyu/opencode
+```
 
-实现上的复用粒度是 parent commit + 固定的 89 个 held-out 题目：
+基线 commit 必须同时存在于 OpenCode git 仓库和 AFS；首次 rollout 前应确认：
 
-- 同一个 parent 在后续 step 中继续使用同一份 89-task baseline 结果；
-- 每轮变化的 32 个 held-in 只单独补采样，并与缓存的 89-task 结果合并；
-- 候选晋级时，候选已经完成的 89-task 结果直接成为新 parent 的 baseline，不再重复跑；
-- 缓存保存在 run 目录的 `baseline-cache/<commit>.json`，并校验题目集合、模型 endpoint、timeout、重试和任务目录元数据。
+```bash
+stat /sandbox-data/duchenyu/opencode/5c23e88/opencode
+```
 
-## 5. 单条轨迹的标准输入
+训练器相关开关：
 
-进化模块处理一条可分析轨迹时，标准输入是以下五类文件：
+| 变量 | 作用 |
+| --- | --- |
+| `HARNESS_EVOLVE_INTERVAL` | 每 N 个训练 step 触发；`0` 关闭 |
+| `HARNESS_EVOLVE_CMD` | 一轮进化的 shell 命令 |
+| `HARNESS_EVOLVE_STRICT` | `1` 时流水线错误终止 smoke/训练；默认保留当前 harness 继续 |
+| `HARNESS_EVOLVE_ON_START` | `1` 时在恢复训练进入循环前补跑一轮 |
+| `HARNESS_EVOLVE_ON_START_TRAJ_ROOT` | ON_START 使用的旧 trajectory 根目录 |
+
+`HARNESS_EVOLVE_ROLLOUT_ID` 由训练器在调用命令时注入，不需要用户设置。
+
+DAPO/lookahead launcher 默认关闭进化，但保留调用方显式设置的开关。`HARNESS_EVOLVE_INTERVAL=0` 与 `HARNESS_EVOLVE_ON_START=1` 可以组合为仅恢复时运行一次；launcher 仍会准备版本状态、采集、Bun、配置和 Python 路径。此时应设置 `HARNESS_EVOLVE_ON_START_TRAJ_ROOT` 指向旧 run 的证据目录。
+
+`POLAR_TASK_FORMAT=auto` 默认根据输入 JSONL 首条非空记录的 MiMo metadata 选择训练模板，也可显式设为 `mimo` 或 `terminal_bench`。该变量会传入 rjob。
+
+## 3. rl_evolve.yaml 与九个覆盖变量
+
+`rl_evolve.yaml` 决定证据配额、evolver、gate 和输出位置。下面九个环境变量可以按一次训练覆盖共享 YAML；唯一真相是 `harness_evolution/rl/__main__.py::_ENV_OVERRIDES`：
+
+| 环境变量 | YAML 字段 | 含义 |
+| --- | --- | --- |
+| `HARNESS_EVOLVE_EVOLVE_CONFIG` | `evolve_config` | 候选生成配置 |
+| `HARNESS_EVOLVE_GATE_CONFIG` | `gate_config` | 静态/动态门控配置 |
+| `HARNESS_EVOLVE_GATE_MODE` | `gate_mode` | `dynamic` 或 `static_only` |
+| `HARNESS_EVOLVE_EVOLVER` | `evolver` | evolver preset，例如 `sglang` 或 `codex` |
+| `HARNESS_EVOLVE_WORK_ROOT` | `work_root` | 每轮工作目录根路径 |
+| `HARNESS_EVOLVE_STAGE_DIR` | `stage_dir` | 版本/二进制 staging 目录 |
+| `HARNESS_EVOLVE_WINDOW` | `window` | 向后扫描的 rollout 目录数 |
+| `HARNESS_EVOLVE_N_FAIL` | `n_fail` | 每轮最多选取的失败任务数 |
+| `HARNESS_EVOLVE_N_SUCCESS` | `n_success` | 每轮最多选取的成功任务数 |
+
+命令行的 `--n-fail`、`--n-success`、`--window`、`--evolver` 和 `--gate-mode` 优先于环境变量；环境变量优先于 YAML。
+
+## 4. 证据与任务身份
+
+每条可用证据至少包含：
 
 ```text
 instruction.md
-trajectory.json                 # 或等价的 trajectory.jsonl
-openai-messages.jsonl           # OpenAI 增量消息格式
-openai-tools.json               # 工具定义
-verifier-summary.json           # 脱敏后的结果摘要
-verifier-feedback.json          # verifier 执行输出与解析后的失败检查
-```
-
-各文件职责：
-
-- `instruction.md`：题目要求和约束；
-- `trajectory.json`：OpenCode 事件时间线，包含 assistant 输出、工具调用和工具结果；
-- `openai-messages.jsonl`：实际请求的增量消息，保留初始提示以及每轮新增消息，不能每轮重复写完整上下文；
-- `openai-tools.json`：当时模型可见的工具 schema 和说明；
-- `verifier-summary.json`：只保留 reward、通过/失败、阶段、退出码、超时和基础设施错误类别等信息。
-- `verifier-feedback.json`：保留限长、脱敏后的 verifier stdout/stderr，并解析测试数量、失败检查名称和 assertion；不包含 verifier 源码。
-
-沙箱中的 `agent/llm-reqs/*-resp.sse` 是底层模型请求/响应的原始流，只用于低级调试，不是进化输入。OpenSandbox gate 默认不下载这类原始 wire 文件；如需专门排查代理或模型协议问题，可显式设置 `HARNESSRL_KEEP_RAW_TRACE_WIRE=1`。
-
-以下文件不是进化模型的主要语义输入：
-
-- `verifier.txt`：禁止提供，避免泄露 checker 细节和产生 reward hacking；
-- `agent.remote.jsonl`：只作为调试备份，不能代替 OpenAI 增量轨迹；
-- `trial.json`、`result.json`：用于状态统计和恢复，通常不直接送入模型；
-- 原始 verifier stdout/stderr、隐藏测试和期望答案：禁止提供给进化模型。
-
-如果某条 trial 只有 `agent.remote.jsonl` 或只有旧版 `trajectory.json`，它可以进入调试和统计，但不能被标记为“完整上下文轨迹”。
-
-## 6. 阶段 C：artifact preflight
-
-进入诊断前必须检查本轮 32 个 held-in trial：
-
-```bash
-find "$HELD_IN_DIR" -name 'instruction.md' | wc -l
-find "$HELD_IN_DIR" -name 'trajectory.json' -o -name 'trajectory.jsonl' | wc -l
-find "$HELD_IN_DIR" -name 'openai-messages.jsonl' | wc -l
-find "$HELD_IN_DIR" -name 'openai-tools.json' | wc -l
-find "$HELD_IN_DIR" -name 'verifier-summary.json' | wc -l
-find "$HELD_IN_DIR" -name 'verifier-feedback.json' | wc -l
-find "$HELD_IN_DIR" -name 'result.json' | wc -l
-```
-
-同时生成 `coverage.json`，至少记录：
-
-```json
-{
-  "selected": 32,
-  "diagnosable": 0,
-  "passed": 0,
-  "failed": 0,
-  "infrastructure_errors": 0,
-  "missing_artifacts": [],
-  "fallback": false
-}
-```
-
-基础设施错误和缺少完整上下文的 trial 必须留在统计中，但不能伪装成正常失败轨迹交给诊断模型。缺少完整上下文的 trial 会保留在 coverage 中并跳过诊断证据；只要本轮仍有至少一条可分析的完整轨迹，提案阶段就可以继续。只有完整轨迹数量为 0 时，才阻止提案。
-
-## 7. 阶段 D：逐轨迹诊断
-
-每次诊断只分析一条 trial。推荐读取顺序：
-
-1. `trajectory.json`；
-2. `openai-messages.jsonl`；
-3. `openai-tools.json`；
-4. `instruction.md`；
-5. 脱敏后的 `verifier-summary.json`；
-6. `verifier-feedback.json`，先确认 verifier 实际拒绝了什么；
-7. 必要时读取 `llm-context.jsonl` 核对请求边界。
-
-正确和错误轨迹都要分析。正确轨迹用于提取有效策略，错误轨迹用于发现失败模式；不能只保留 reward 为 1 的轨迹。
-
-单轨迹诊断要回答：
-
-- 任务目标和限制是什么；
-- agent 的关键行动和工具调用是什么；
-- 哪个决策、工具行为或上下文因素导致成功/失败；
-- 是否存在重复调用、无效循环、错误恢复、超时、环境依赖或进程生命周期问题；
-- 问题属于 agent 推理、工具使用、harness 行为还是基础设施；
-- 哪个 harness 模块应该怎样改，以及如何验证。
-
-输出：
-
-```text
-step-XX/diagnosis/per_trace/<trace_id>.json
-```
-
-每个诊断至少包含 `trace_id`、`task`、`reward_status`、`failure_category`、`evidence_spans`、`root_cause`、`harness_surface`、`recommendation` 和 `confidence`。
-
-## 8. 阶段 E：跨轨迹汇总
-
-汇总器读取本轮所有可分析的逐轨迹诊断，不要把 32 条完整原始轨迹一次性拼进一个 prompt。
-
-输出：
-
-```text
-step-XX/diagnosis/coverage.json
-step-XX/diagnosis/aggregate.json
-step-XX/diagnosis/aggregate.md
-```
-
-汇总必须包含：
-
-- 共性失败模式；
-- 成功模式；
-- 每个模式的触发条件；
-- 受影响的 OpenCode/harness 模块；
-- 支持该结论的 trace id；
-- 具体改进建议；
-- 风险、潜在副作用和验证方法。
-
-`aggregate.json` 和 `aggregate.md` 不是可有可无的报告，而是 harness 改进器的主要跨轨迹输入。改进器可以回读 `diagnosis/per_trace/*.json` 和原始五类轨迹文件进行核对。
-
-## 9. 阶段 F：生成候选 harness
-
-候选改进器的输入包括：
-
-```text
-coverage.json
-aggregate.json
-aggregate.md
-diagnosis/per_trace/*.json
-必要时：instruction.md、trajectory.json、openai-messages.jsonl、openai-tools.json、verifier-summary.json
-当前 OpenCode 仓库
-opencode-architecture-evolution skill
-```
-
-改进约束：
-
-- 只修改通用 OpenCode/harness 行为；
-- 不修改 benchmark 题目解法；
-- 不读取或修改其他仓库；
-- 不读取 `verifier.txt`；
-- 每个候选使用独立 worktree；
-- 候选数量由 `--candidates` 或配置文件控制；
-- 候选结束后必须产生 commit，并记录 changed files。
-
-候选生成失败、没有改动或只生成文本建议时，标记为 invalid，不进入 gate。
-
-## 10. 阶段 G：静态 gate 和 Bun 编译
-
-每个候选至少执行：
-
-1. no-op 检查；
-2. TypeScript typecheck；
-3. Bun build；
-4. 最小 smoke test；
-5. 记录完整 commit、二进制路径和日志。
-
-静态 gate 不通过的候选不能占用完整 89 题 gate 资源。
-
-## 11. 阶段 H：动态 held-out gate
-
-对 parent 和每个静态通过候选使用同一批完整 89 个 TB2.1 题目：
-
-- 相同的模型 endpoint/replica；
-- 相同的 task 顺序；
-- 相同的 timeout 和 retry policy；
-- 相同的 verifier；
-- 相同的 sandbox 创建池；
-- 相同的并发配置。
-
-推荐让 baseline、候选 1、候选 2 共用一个 gate 调度池，以减少环境差异。
-
-每个任务都必须保存：
-
-```text
-trial.json
 result.json
-retry_history.json
-agent.remote.jsonl
-verifier 输出和错误分类
+agent/trajectory.json
+agent/openai-messages.jsonl
+agent/openai-tools.json
+agent/verifier-summary.json
+agent/artifact-status.json   # complete=true
 ```
 
-动态 gate 的晋级规则：
+MiMo 任务以 `dataset_task_id` 去重，并把 `task_file`、SHA-256、dataset type 和 image tag 带到 conversion manifest。dynamic gate 据此重建同一个任务，而不是退回固定 canary。
 
-1. 先比较 89 个 held-out 的有效通过数或通过率；
-2. 候选必须达到完整性要求，不能有未完成任务；
-3. 基础设施错误必须重试并单独报告，不能静默当成 agent 失败；
-4. 选择 held-out 分数最高且满足静态 gate 的候选；
-5. 如果没有候选超过 parent，则 parent 晋级到下一轮；
-6. 无论是否晋级，下一轮都重新抽取 32 个 TMAX held-in。
+源数据集字段在提交 Polar 时进入 task metadata 的 `dataset_*` 命名空间，避免与 runtime `task_id` 混淆。`SessionResult -> Sample` 后，dump 优先读取 `metadata.polar.trajectory_metadata.task_metadata` 中的这些字段，兼容旧嵌套原名及顶层字段。不要用手工合并 Sample metadata 或修改 manifest 掩盖接缝问题。
 
-历史实验曾把 32 个 TMAX 和 89 个 TB2.1 合并调度成 121 个 trial，但最终应按 held-in/held-out 分开统计，晋级只看 89 个 TB2.1。
+正常 verifier 失败（reward 0）是有效负样本；runtime、agent timeout、verifier timeout、无效 verifier 和不完整 trace 属于基础设施/采集失败，不得伪装成负样本。
 
-## 12. 阶段 I：进入下一轮和 resume
+## 5. 门控与发布
 
-每轮结束写入：
+静态 gate 顺序是 no-op 检查、typecheck、build、binary diff 和 smoke。dynamic gate 对 parent 和所有静态 survivor 使用相同任务、模型、timeout 和 verifier，并逐任务计算 win/loss/tie：
 
 ```text
-step-XX/gate.json
-step-XX/step.json
-state.json
+net = wins - losses
+ACCEPT iff net >= accept_net_wins
 ```
 
-必须记录：
+当前门控复用原进化模块的 infra error / imputed-zero 评分规则，按 2026-10-17 的决定保持不变；证据 preflight 对 infra/采集失败的过滤是另一处边界。
 
-- parent commit；
-- 每个候选 commit；
-- 每个候选的 changed files；
-- held-in 32 题统计；
-- held-out 89 题统计；
-- infrastructure error 和 retry 统计；
-- 是否接受候选；
-- winner commit；
-- 下一轮 32 题的 task ids；
-- 下一轮轨迹来源目录。
+`gate_1179.yaml` 显式设置 `heldout_gate.backend: opensandbox`，避免残留 Harbor 模板影响后端选择。OpenSandbox gate 会在运行前发布两侧二进制。只有在确认 commit 对应二进制已经存在于默认 AFS 路径时，调试重跑才可设置 `HARNESS_AFS_PUBLISH=0`。
 
-resume 前检查：
+## 6. 输出与退出语义
 
-```bash
-python3 -m json.tool "$RUN_ROOT/state.json"
-python3 -m json.tool "$RUN_ROOT/step-XX/gate.json"
-find "$RUN_ROOT/step-XX" -name '*.json' -size 0
-```
-
-不要只根据 console.log 判断已完成。必须以 `step.json`、`gate.json` 和各 trial 的 `trial.json` 为准。
-
-### 12.1 可插拔的晋升记忆
-
-memory 默认关闭。旧配置未提供 `memory`，或显式设置为下面这样时，候选提示词、候选工作区和状态文件与原流程一致：
-
-```yaml
-memory: none
-```
-
-需要让后续候选了解当前 harness 的晋升历史时，使用：
-
-```yaml
-memory:
-  method: accepted_lineage
-  options: {}
-```
-
-该策略只在候选通过 held-out 动态门控并成为 winner 后追加一条记录。长期文件默认是：
+每轮写到 `work_root/stepXXXXXX_MMDD-HHMMSS/`，主要产物包括：
 
 ```text
-$RUN_ROOT/reports/memory/accepted-lineage.jsonl
+tb_job/                 # 被选证据和 conversion_manifest.json
+workspaces/             # 候选 worktree
+gate-reports/           # static/dynamic gate 报告
+round.json              # 本轮最终结果
 ```
 
-生成候选前，同一份内容会复制到每个候选工作区：
+最后一行 stdout 总是 JSON。退出码 `0` 包括 ACCEPT、REJECT 和没有候选值得门控；非零表示流水线自身失败。默认训练会保留当前 harness 继续，`HARNESS_EVOLVE_STRICT=1` 会把错误向上抛出。
 
-```text
-.harness_evolver/memory/accepted-lineage.jsonl
-```
+## 7. 环境注意事项
 
-每条记录包含 step、parent commit、winner commit、候选编号、改动摘要、changed files、parent 分数和 winner 分数。摘要只用来定位历史改动；模型需要使用 `git show <winner_commit>` 或 `git diff <parent_commit>..<winner_commit>` 查看真实代码。memory 文件通过 worktree 的本地 Git exclude 排除，不属于候选提交。
+- Polar OpenSandbox runtime 需要 Python 3.11+。
+- Codex preset 使用当前进程的 `CODEX_HOME` 和代理设置；通过 rjob/Ray 时这些显式变量会保留。ChatGPT 凭证目录必须在训练容器内可见，参见 [Codex 验证记录](../../docs/codex-validation-20261017.md)。
+- 从登录节点做 smoke 必须设置 `POLAR_SANDBOX_RUN_ONLY=1`、绝对路径 `RUN_ROOT` 和 `POLAR_SANDBOX_CAPACITY_ROOT=$RUN_ROOT/capacity`。
+- `HARNESSRL_TB21_RUNTIME` 不仅要是环境变量，还必须加入 `PYTHONPATH`，否则 trace 归一化会静默降级。
+- `AGENT_GATEWAY_URL` 必须从 OpenSandbox 内可达；登录节点内部的 Kubernetes `.svc` 地址不一定可达。应使用训练配置中的 LLM-Proxy/evalservice 地址。
+- MiMo 任务至少需要 8 GiB sandbox memory，并以任务 JSON 的绝对 `cwd` 同时设置 runtime workdir 和 `TASK_WORKSPACE`。
 
-如需继承另一轮实验的已接受历史，可配置只读种子：
+建议 smoke 使用 `HARNESS_EVOLVE_INTERVAL=1`、少量证据和 `HARNESS_EVOLVE_STRICT=1`。先用 `static_only` 验接线，再用 `dynamic` 验证真实 parent/candidate 对照。
 
-```yaml
-memory:
-  method: accepted_lineage
-  options:
-    seed_path: /absolute/path/to/accepted-lineage.jsonl
-```
+2026-10-17 已完成 ON_START 真机链路验收（真实 Codex、动态 ACCEPT、隔离晋升、下一只沙箱安装），范围与收据见 [ON_START 验收记录](../../docs/on-start-validation-20261017.md)。GPU checkpoint 恢复及后续训练尚未验收。
 
-resume 重复处理同一步时按 `step + winner_commit` 去重。失败候选、静态 gate 失败候选、动态 gate 未晋升候选都不会写入 memory。
-
-## 13. 并发、容量和重试
-
-模型请求并发、sandbox 创建并发和题目评测并发是三个不同参数，不能混为一个 `-j`：
-
-```text
-题目评测并发       --jobs / -j
-模型请求并发       MODEL_REQUEST_CONCURRENCY
-sandbox 创建并发   SANDBOX_CREATE_CONCURRENCY
-```
-
-使用本地容量账本时，必须保证 run id、容量目录和实际 worker 环境一致。worker 没有继承环境变量时，本地模式不会生效。
-
-建议对以下错误做有限指数退避重试：
-
-- sandbox route not active / route not found；
-- 控制面连接超时；
-- verifier tests did not execute；
-- command transport error；
-- sandbox 创建的临时网络错误。
-
-重试必须写入 `retry_history.json`，每次重试使用新的 sandbox，不能复用已经失效的 route。重试仍失败时保留原始错误类别，不要把它伪装成模型 reward。
-
-## 14. 历史两个好候选实验的说明
-
-之前产生两个好候选的实验目录是：
-
-```text
-/mnt/shared-storage-gpfs2/safewt-share02/sunyoubang/yuanjiarui/evolution-harnessRL-tmax32-fulltb21-rerun-step1-20261001
-```
-
-候选 commit：
-
-```text
-768a0a0282b8ffad1e70693c029b193a4ae49e7e
-281d5130f27e9e79d8142034b4bc00098d9a28c6
-```
-
-它们的 held-out 分数分别是 30/89 和 28/89，baseline 是 24/89。这个实验使用的是旧版输入：主要有 `trajectory.json`、`instruction.md` 和结果摘要，没有完整的 `openai-messages.jsonl`、`openai-tools.json` 和 `llm-context.jsonl`。
-
-因此，这两个候选的效果是真实的，但不能把那次实验描述成“完整 OpenAI 上下文进化”。以后按本手册运行时，应先通过 artifact preflight 确认五类单轨迹输入齐全，再进入诊断和候选生成。
-
-## 15. 常见错误
-
-- 用 held-out 轨迹作为进化输入，导致评测污染；
-- 只分析 reward=1 的轨迹，丢失失败模式；
-- 把 agent timeout 直接记为 missing 并跳过 verifier；
-- 只保存 `agent.remote.jsonl`，却宣称有完整上下文；
-- 把 `verifier.txt` 或隐藏测试输出交给进化模型；
-- baseline、candidate 使用不同 task 顺序、不同重试策略或不同模型池；
-- 用总 121 题分数代替 89 题 held-out 分数做晋级；
-- 使用 `max_failed_trials: 1` 导致一次环境错误就让候选失效；
-- 修改 wxh 下的实验结果，造成空间不足或污染原始代码；
-- 只看 tmux 或 console.log，不核对 `state.json`、`step.json`、`gate.json` 和 trial 文件。
+独立进化侧的证据导出在完整校验成功后默认清理中间 context 和 raw wire，并支持后续 materialize 复用保留的 OpenAI exports；导出失败则保留原始文件。可用 HARNESSRL_KEEP_LLM_CONTEXT=1、HARNESSRL_KEEP_RAW_TRACE_WIRE=1 保留调试文件。构建环境、原生依赖等待及证据保留的合入与回归见 [2026-10-18 合入记录](../../docs/independent-fixes-merge-20261018.md)。

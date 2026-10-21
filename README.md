@@ -2,6 +2,11 @@
 
 中文使用说明见 [docs/guide.zh.md](docs/guide.zh.md)。
 
+This repository contains the `harness-evolution` package extracted from
+[`harnessRL`](https://github.com/1rubbishyuan/harnessRL), including the current
+working-tree updates. See [the source and dependency notes](docs/source-export.md)
+before running a complete evolution loop from this checkout.
+
 Evolve an agent harness (currently OpenCode) from its own trajectories. Each step:
 
 1. **traces** – sample tasks with the current harness and normalize every trial into a fixed set of files
@@ -44,6 +49,12 @@ pip install -e ".[test]"
 pytest
 ```
 
+The complete test suite and OpenSandbox backend also require the companion
+`polar` and `harness_dist` sources; the RL bridge uses `trainer`. These are not
+vendored into this repository. Set `HARNESSRL_ROOT` to their workspace as described
+in [source-export.md](docs/source-export.md). The bundled trace converters can be
+selected with `HARNESSRL_TB21_RUNTIME=$PWD/tools/session-trace-runtime`.
+
 Everything goes through the `hevo` command:
 
 | Command | What it does |
@@ -51,7 +62,8 @@ Everything goes through the `hevo` command:
 | `hevo run run.yaml [--resume] [--dry-run]` | the full two-sided loop described by one `run.yaml` (see `configs/examples/run.yaml`) |
 | `hevo evolve --config evolve.yaml --job-dir JOB` | diagnose an existing trajectory job and propose candidates; no sampling, no gate |
 | `hevo status RUN_DIR` | summarize a run's `state.json` |
-| `hevo loop ...`, `hevo gate ...`, `hevo slime-pipeline ...` | the underlying modules with their raw flags |
+| `hevo rl-round --config rl_evolve.yaml` | one evolution round called at an RL step boundary |
+| `hevo loop ...`, `hevo gate ...` | the standalone loop and gate modules with their raw flags |
 
 `run.yaml` names the evolve and gate configs, the task splits, the loop settings, the gate
 model, and the environment the run exports. `hevo run --dry-run` prints the resulting

@@ -93,6 +93,25 @@ def test_local_capacity_mode_gets_a_run_scoped_journal(tmp_path: Path) -> None:
     assert run_environment(config)["SANDBOX_CAPACITY_ROOT"] == "/shared/cap"
 
 
+def test_initial_harness_must_be_checked_out_at_base_commit(tmp_path: Path) -> None:
+    import subprocess
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], cwd=tmp_path, check=True, text=True, capture_output=True).stdout.strip()
+
+    git("init", "-q")
+    for name in ("first", "second"):
+        (tmp_path / "f.txt").write_text(name, encoding="utf-8")
+        git("add", "f.txt")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", name)
+    second = git("rev-parse", "HEAD")
+    first = git("rev-parse", "HEAD~1")
+    two_sided._require_checkout_at(tmp_path, second)
+    two_sided._require_checkout_at(tmp_path, second[:12])
+    with pytest.raises(SystemExit, match="not initial.base_commit"):
+        two_sided._require_checkout_at(tmp_path, first)
+
+
 def test_prepare_run_dir_freezes_configs_and_guards_state(tmp_path: Path) -> None:
     config = load_run_config(_write_run_yaml(tmp_path))
     with pytest.raises(SystemExit, match="state is missing"):
